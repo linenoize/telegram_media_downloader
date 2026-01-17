@@ -238,22 +238,41 @@ def extract_info_from_link(link: str) -> Link:
         result.group_id = paths[0]
     elif len(paths) == 2:
         if paths[0] == "c":
-            result.group_id = int(f"-100{paths[1]}")
+            # Only convert to numeric ID if paths[1] is actually numeric
+            if paths[1].isdigit():
+                result.group_id = int(f"-100{paths[1]}")
+            else:
+                # Invalid format for private channel - should be numeric
+                return Link()
         else:
             result.group_id = paths[0]
-            result.post_id = int(paths[1])
+            try:
+                result.post_id = int(paths[1])
+            except ValueError:
+                # If second path is not numeric, treat as invalid
+                return Link()
     elif len(paths) == 3:
         if paths[0] == "c":
-            result.group_id = int(f"-100{paths[1]}")
-            result.post_id = int(paths[2])
+            # Only convert to numeric ID if paths[1] is actually numeric
+            if paths[1].isdigit() and paths[2].isdigit():
+                result.group_id = int(f"-100{paths[1]}")
+                result.post_id = int(paths[2])
+            else:
+                return Link()
         else:
             result.group_id = paths[0]
-            result.topic_id = int(paths[1])
-            result.post_id = int(paths[2])
+            try:
+                result.topic_id = int(paths[1])
+                result.post_id = int(paths[2])
+            except ValueError:
+                return Link()
     elif len(paths) == 4 and paths[0] == "c":
-        result.group_id = int(f"-100{paths[1]}")
-        result.topic_id = int(paths[2])
-        result.post_id = int(paths[3])
+        if paths[1].isdigit() and paths[2].isdigit() and paths[3].isdigit():
+            result.group_id = int(f"-100{paths[1]}")
+            result.topic_id = int(paths[2])
+            result.post_id = int(paths[3])
+        else:
+            return Link()
 
     return result
 

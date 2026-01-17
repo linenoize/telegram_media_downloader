@@ -1,6 +1,7 @@
 """Pyrogram ext"""
 
 import asyncio
+import inspect
 import os
 import secrets
 import struct
@@ -972,7 +973,7 @@ async def fetch_message(client: pyrogram.Client, message: pyrogram.types.Message
     )
 
 
-async def retry(func: Callable, args: tuple = (), max_attempts=3, wait_second=15):
+async def retry(func: Callable, args: tuple = (), max_attempts=5, wait_second=30):
     """
     Asynchronously retries the provided function
     a specified number of times with a specified wait time between retries.
@@ -1199,10 +1200,12 @@ class HookSession(pyrogram.session.Session):
 
 # pylint: disable=all
 class HookClient(pyrogram.Client):
-    """Hook Client"""
+    """Hook Client with connection resilience"""
 
     # pylint: disable=R0901
     START_TIME_OUT = 60
+    MAX_RECONNECT_ATTEMPTS = 5
+    RECONNECT_DELAY = 5
 
     def __init__(self, name: str, **kwargs):
         if "start_timeout" in kwargs:
@@ -1212,6 +1215,29 @@ class HookClient(pyrogram.Client):
             kwargs.pop("start_timeout")
 
         super().__init__(name, **kwargs)
+        self._reconnect_attempts = 0
+        self._is_reconnecting = False
+
+    async def _create_session(self) -> "HookSession":
+        """Create a session compatible with different Pyrogram/Kurigram versions."""
+        session_params = set(inspect.signature(pyrogram.session.Session.__init__).parameters)
+
+        if "server_address" in session_params and "port" in session_params:
+            return HookSession(
+                self,
+                await self.storage.dc_id(),
+                await self.storage.server_address(),
+                await self.storage.port(),
+                await self.storage.auth_key(),
+                await self.storage.test_mode(),
+            )
+
+        return HookSession(
+            self,
+            await self.storage.dc_id(),
+            await self.storage.auth_key(),
+            await self.storage.test_mode(),
+        )
 
     async def connect(
         self,
@@ -1232,12 +1258,7 @@ class HookClient(pyrogram.Client):
 
         await self.load_session()
 
-        self.session = HookSession(
-            self,
-            await self.storage.dc_id(),
-            await self.storage.auth_key(),
-            await self.storage.test_mode(),
-        )
+        self.session = await self._create_session()
         self.session.start_timeout(self.START_TIME_OUT)
 
         await self.session.start()
@@ -1276,6 +1297,145 @@ class HookClient(pyrogram.Client):
             await self.initialize()
 
             return self
+
+    async def handle_download(self, packet):
+        """
+        Handle downloads with automatic reconnection on connection loss.
+        """
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                return await super().handle_download(packet)
+            except (OSError, ConnectionError) as e:
+                if "Connection lost" in str(e) or isinstance(e, ConnectionError):
+                    if attempt < max_attempts - 1:
+                        logger.warning(
+                            f"Connection lost during download (attempt {attempt + 1}/{max_attempts}), "
+                            f"attempting to reconnect..."
+                        )
+                        await asyncio.sleep(self.RECONNECT_DELAY)
+                        await self._reconnect()
+                    else:
+                        logger.error(
+                            f"Failed to complete download after {max_attempts} attempts due to connection loss"
+                        )
+                        raise
+                else:
+                    raise
+            except Exception:
+                raise
+
+    async def _reconnect(self):
+        """
+        Internal method to handle reconnection logic.
+        """
+        if self._is_reconnecting:
+            # Already reconnecting, wait for it to complete
+            while self._is_reconnecting:
+                await asyncio.sleep(1)
+            return
+
+        self._is_reconnecting = True
+
+        try:
+            logger.info("Attempting to reconnect to Telegram...")
+
+            # Try to disconnect and cleanup
+            try:
+                if self.is_connected:
+                    # Stop the session
+                    if hasattr(self, 'session') and self.session:
+                        try:
+                            await self.session.stop()
+                        except Exception as e:
+                            logger.debug(f"Error stopping session: {e}")
+
+                    self.is_connected = False
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.debug(f"Error during cleanup: {e}")
+
+            # Wait before reconnecting
+            await asyncio.sleep(self.RECONNECT_DELAY)
+
+            # Reconnect with session recreation
+            for attempt in range(self.MAX_RECONNECT_ATTEMPTS):
+                try:
+                    logger.info(f"Reconnection attempt {attempt + 1}/{self.MAX_RECONNECT_ATTEMPTS}...")
+
+                    # Recreate session
+                    await self.load_session()
+
+                    self.session = await self._create_session()
+                    self.session.start_timeout(self.START_TIME_OUT)
+
+                    await self.session.start()
+                    self.is_connected = True
+
+                    # Verify connection
+                    await self.invoke(pyrogram.raw.functions.updates.GetState())
+
+                    self._reconnect_attempts = 0
+                    logger.success("Successfully reconnected to Telegram!")
+                    return
+                except Exception as e:
+                    logger.warning(
+                        f"Reconnection attempt {attempt + 1}/{self.MAX_RECONNECT_ATTEMPTS} failed: {e}"
+                    )
+                    if attempt < self.MAX_RECONNECT_ATTEMPTS - 1:
+                        await asyncio.sleep(self.RECONNECT_DELAY * (attempt + 1))
+
+            raise ConnectionError("Failed to reconnect after maximum attempts")
+
+        finally:
+            self._is_reconnecting = False
+
+    async def invoke(
+        self,
+        query: pyrogram.raw.core.TLObject,
+        retries: int = pyrogram.session.Session.MAX_RETRIES,
+        timeout: float = pyrogram.session.Session.WAIT_TIMEOUT,
+        sleep_threshold: float = None,
+    ):
+        """
+        Override invoke to add connection loss handling.
+
+        Args:
+            query: The query to invoke
+            retries: Number of retries
+            timeout: Timeout in seconds
+            sleep_threshold: Sleep threshold for flood wait
+
+        Returns:
+            Result from the query
+        """
+        # Skip connection retry if we're already in the middle of reconnecting
+        # to avoid infinite recursion
+        if self._is_reconnecting:
+            return await super().invoke(query, retries, timeout, sleep_threshold)
+
+        max_connection_retries = 3
+        for conn_attempt in range(max_connection_retries):
+            try:
+                return await super().invoke(query, retries, timeout, sleep_threshold)
+            except OSError as e:
+                if "Connection lost" in str(e) or "Connection" in str(e.__class__.__name__):
+                    if conn_attempt < max_connection_retries - 1:
+                        logger.warning(
+                            f"Connection lost during invoke (attempt {conn_attempt + 1}/{max_connection_retries}), "
+                            f"reconnecting..."
+                        )
+                        await asyncio.sleep(self.RECONNECT_DELAY)
+                        await self._reconnect()
+                    else:
+                        logger.error(
+                            f"Failed to invoke after {max_connection_retries} attempts due to connection loss"
+                        )
+                        raise
+                else:
+                    raise
+            except Exception:
+                raise
 
 
 # pylint: disable=R0914,R0913

@@ -36,6 +36,7 @@ from module.pyrogram_extension import (
     set_meta_data,
     upload_telegram_chat_message,
 )
+from module.search import add_search_handler
 from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
@@ -155,10 +156,17 @@ class DownloadBot:
                 "get_info", _t("Get group and user info from message link")
             ),
             types.BotCommand(
+                "get_url", _t("Get Telegram URL for a channel/group by username or ID")
+            ),
+            types.BotCommand(
                 "download",
                 _t(
                     "To download the video, use the method to directly enter /download to view"
                 ),
+            ),
+            types.BotCommand(
+                "dl",
+                _t("Simplified download with date filtering: /dl <link> [start_date] [end_date]")
             ),
             types.BotCommand(
                 "forward",
@@ -178,6 +186,7 @@ class DownloadBot:
             ),
             types.BotCommand("set_language", _t("Set language")),
             types.BotCommand("stop", _t("Stop bot download or forward")),
+            types.BotCommand("search_mega", _t("Search for mega links in a chat")),
         ]
 
         self.app = app
@@ -213,6 +222,13 @@ class DownloadBot:
             MessageHandler(
                 download_from_bot,
                 filters=pyrogram.filters.command(["download"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                download_with_date_prompt,
+                filters=pyrogram.filters.command(["dl"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
@@ -255,6 +271,13 @@ class DownloadBot:
             MessageHandler(
                 get_info,
                 filters=pyrogram.filters.command(["get_info"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                get_channel_url,
+                filters=pyrogram.filters.command(["get_url"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
@@ -310,6 +333,8 @@ class DownloadBot:
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
+
+        add_search_handler(_bot)
 
 
 _bot = DownloadBot()
@@ -462,18 +487,50 @@ async def get_info(client: pyrogram.Client, message: pyrogram.types.Message):
         )
         return
 
-    chat_id, message_id, _ = await parse_link(_bot.client, args[1])
+    try:
+        chat_id, message_id, _ = await parse_link(_bot.client, args[1])
 
-    entity = None
-    if chat_id:
+        if not chat_id:
+            msg = (
+                f"{_t('Invalid Telegram link format')}.\n\n"
+                f"{_t('Supported formats')}:\n"
+                f"• https://t.me/username\n"
+                f"• https://t.me/username/123\n"
+                f"• https://t.me/c/1234567890/123\n"
+            )
+            await client.send_message(message.from_user.id, msg)
+            return
+
+        entity = None
         entity = await _bot.client.get_chat(chat_id)
 
-    if entity:
-        if message_id:
-            _message = await retry(_bot.client.get_messages, args=(chat_id, message_id))
-            if _message:
-                meta_data = MetaData()
-                set_meta_data(meta_data, _message)
+        if entity:
+            if message_id:
+                _message = await retry(_bot.client.get_messages, args=(chat_id, message_id))
+                if _message:
+                    meta_data = MetaData()
+                    set_meta_data(meta_data, _message)
+                    msg = (
+                        f"`\n"
+                        f"{_t('Group/Channel')}\n"
+                        f"├─ {_t('id')}: {entity.id}\n"
+                        f"├─ {_t('first name')}: {entity.first_name}\n"
+                        f"├─ {_t('last name')}: {entity.last_name}\n"
+                        f"└─ {_t('name')}: {entity.username}\n"
+                        f"{_t('Message')}\n"
+                    )
+
+                    for key, value in meta_data.data().items():
+                        if key == "send_name":
+                            msg += f"└─ {key}: {value or None}\n"
+                        else:
+                            msg += f"├─ {key}: {value or None}\n"
+
+                    msg += "`"
+                else:
+                    msg = _t("Message not found or you don't have access to it.")
+            else:
+                # Show channel/group info without message details
                 msg = (
                     f"`\n"
                     f"{_t('Group/Channel')}\n"
@@ -481,20 +538,132 @@ async def get_info(client: pyrogram.Client, message: pyrogram.types.Message):
                     f"├─ {_t('first name')}: {entity.first_name}\n"
                     f"├─ {_t('last name')}: {entity.last_name}\n"
                     f"└─ {_t('name')}: {entity.username}\n"
-                    f"{_t('Message')}\n"
+                    f"`"
                 )
+        else:
+            msg = _t("Could not find the chat. Make sure you have access to it.")
+    except Exception as e:
+        logger.error(f"Error in get_info: {e}")
+        msg = (
+            f"{_t('Error retrieving information')}.\n"
+            f"{_t('Make sure')}:\n"
+            f"• {_t('The link is valid')}\n"
+            f"• {_t('You have access to the chat')}\n"
+            f"• {_t('The bot is a member of the chat (for private groups)')}\n"
+        )
 
-                for key, value in meta_data.data().items():
-                    if key == "send_name":
-                        msg += f"└─ {key}: {value or None}\n"
-                    else:
-                        msg += f"├─ {key}: {value or None}\n"
-
-                msg += "`"
     await client.send_message(
         message.from_user.id,
         msg,
     )
+
+
+async def get_channel_url(client: pyrogram.Client, message: pyrogram.types.Message):
+    """
+    Get the Telegram URL for a channel/group.
+    Usage: /get_url <channel_username or channel_id>
+    """
+
+    args = message.text.split()
+    if len(args) != 2:
+        msg = (
+            f"{_t('Invalid command format')}.\n\n"
+            f"<b>{_t('Usage')}:</b>\n"
+            f"<i>/get_url @channel_username</i>\n"
+            f"<i>/get_url channel_username</i>\n"
+            f"<i>/get_url -1001234567890</i>\n\n"
+            f"<b>{_t('Examples')}:</b>\n"
+            f"<i>/get_url @telegram</i>\n"
+            f"<i>/get_url telegram</i>\n"
+            f"<i>/get_url -1001234567890</i>\n"
+        )
+        await client.send_message(
+            message.from_user.id,
+            msg,
+            parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    channel_input = args[1].strip()
+
+    # Remove @ if present
+    if channel_input.startswith("@"):
+        channel_input = channel_input[1:]
+
+    try:
+        # Get chat info
+        entity = await _bot.client.get_chat(channel_input)
+
+        if not entity:
+            await client.send_message(
+                message.from_user.id,
+                _t("Could not find the channel/group. Make sure you have access to it."),
+                reply_to_message_id=message.id
+            )
+            return
+
+        # Build the URL based on chat type
+        url = None
+        chat_type = None
+
+        if entity.username:
+            # Public channel/group
+            url = f"https://t.me/{entity.username}"
+            chat_type = "Public"
+        else:
+            # Private channel/group - use the numeric ID
+            # For private channels, the ID format is -100xxxxxxxxxx
+            # We need to remove the -100 prefix to get the channel ID for the URL
+            chat_id = str(entity.id)
+            if chat_id.startswith("-100"):
+                channel_id = chat_id[4:]  # Remove -100 prefix
+                url = f"https://t.me/c/{channel_id}/1"
+                chat_type = "Private"
+            else:
+                # Regular group ID
+                url = f"https://t.me/c/{chat_id}/1"
+                chat_type = "Private"
+
+        msg = (
+            f"<b>{_t('Channel/Group Information')}:</b>\n\n"
+            f"<b>{_t('Name')}:</b> {entity.title}\n"
+            f"<b>{_t('Type')}:</b> {chat_type} {entity.type.value if entity.type else 'Unknown'}\n"
+            f"<b>{_t('ID')}:</b> <code>{entity.id}</code>\n"
+        )
+
+        if entity.username:
+            msg += f"<b>{_t('Username')}:</b> @{entity.username}\n"
+
+        msg += f"\n<b>{_t('URL')}:</b> <code>{url}</code>\n"
+
+        if entity.description:
+            desc = entity.description[:200] + "..." if len(entity.description) > 200 else entity.description
+            msg += f"\n<b>{_t('Description')}:</b>\n{desc}\n"
+
+        await client.send_message(
+            message.from_user.id,
+            msg,
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+            reply_to_message_id=message.id
+        )
+
+    except Exception as e:
+        logger.error(f"Error in get_channel_url: {e}")
+        msg = (
+            f"{_t('Error retrieving channel information')}.\n\n"
+            f"<b>{_t('Possible reasons')}:</b>\n"
+            f"• {_t('Channel/group does not exist')}\n"
+            f"• {_t('You do not have access to the channel/group')}\n"
+            f"• {_t('The bot is not a member of the channel/group')}\n"
+            f"• {_t('Invalid channel ID or username')}\n\n"
+            f"<b>{_t('Error details')}:</b> {str(e)}\n"
+        )
+        await client.send_message(
+            message.from_user.id,
+            msg,
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+            reply_to_message_id=message.id
+        )
 
 
 async def add_filter(client: pyrogram.Client, message: pyrogram.types.Message):
@@ -646,31 +815,165 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
 # pylint: disable = R0912, R0915,R0914
 
 
+async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.types.Message):
+    """
+    Simplified download command that prompts for date range.
+    Usage: /dl <link> [start_date] [end_date]
+    Example: /dl https://t.me/channel 2024-01-01 2024-12-31
+    """
+
+    args = message.text.split()
+
+    if len(args) < 2:
+        help_msg = (
+            f"{_t('Download messages with optional date filtering')}:\n\n"
+            f"<b>{_t('Usage')}:</b>\n"
+            f"<i>/dl https://t.me/channel</i> - {_t('Download all messages')}\n"
+            f"<i>/dl https://t.me/channel 2024-01-01</i> - {_t('Download from date onwards')}\n"
+            f"<i>/dl https://t.me/channel 2024-01-01 2024-12-31</i> - {_t('Download date range')}\n\n"
+            f"<b>{_t('Date formats')}:</b>\n"
+            f"• YYYY-MM-DD\n"
+            f"• YYYY-MM-DD HH:MM:SS\n"
+            f"• YYYY-MM\n"
+        )
+        await client.send_message(
+            message.from_user.id,
+            help_msg,
+            parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    url = args[1]
+    start_date = args[2] if len(args) > 2 else None
+    end_date = args[3] if len(args) > 3 else None
+
+    # Build filter string
+    download_filter = None
+    if start_date:
+        start_date = replace_date_time(start_date)
+        download_filter = f"message_date>={start_date}"
+        if end_date:
+            end_date = replace_date_time(end_date)
+            download_filter += f"&message_date<={end_date}"
+
+    # Validate filter if provided
+    if download_filter:
+        res, err = _bot.filter.check_filter(download_filter)
+        if not res:
+            await client.send_message(
+                message.from_user.id,
+                f"{_t('Invalid date format')}. {err}",
+                reply_to_message_id=message.id
+            )
+            return
+
+    try:
+        chat_id, _, _ = await parse_link(_bot.client, url)
+        if not chat_id:
+            await client.send_message(
+                message.from_user.id,
+                _t("Invalid Telegram link. Please provide a valid channel/group link."),
+                reply_to_message_id=message.id
+            )
+            return
+
+        entity = await _bot.client.get_chat(chat_id)
+        if not entity:
+            await client.send_message(
+                message.from_user.id,
+                _t("Could not access the chat. Make sure the bot has access to it."),
+                reply_to_message_id=message.id
+            )
+            return
+
+        chat_title = entity.title
+        chat_download_config = ChatDownloadConfig()
+        chat_download_config.last_read_message_id = 1
+        chat_download_config.download_filter = download_filter
+
+        reply_message = f"from {chat_title} "
+        if download_filter:
+            reply_message += f"downloading messages with filter: {download_filter}"
+        else:
+            reply_message += "downloading all messages"
+
+        last_reply_message = await client.send_message(
+            message.from_user.id,
+            reply_message,
+            reply_to_message_id=message.id
+        )
+
+        node = TaskNode(
+            chat_id=entity.id,
+            from_user_id=message.from_user.id,
+            reply_message_id=last_reply_message.id,
+            replay_message=reply_message,
+            limit=0,
+            start_offset_id=1,
+            end_offset_id=0,
+            bot=_bot.bot,
+            task_id=_bot.gen_task_id(),
+        )
+        _bot.add_task_node(node)
+        _bot.app.loop.create_task(
+            _bot.download_chat_task(_bot.client, chat_download_config, node)
+        )
+
+    except Exception as e:
+        logger.error(f"Error in download_with_date_prompt: {e}")
+        await client.send_message(
+            message.from_user.id,
+            f"{_t('Error starting download')}:\n{str(e)}",
+            reply_to_message_id=message.id
+        )
+
+
 async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Message):
     """Download from bot"""
 
     msg = (
         f"{_t('Parameter error, please enter according to the reference format')}:\n\n"
         f"1. {_t('Download all messages of common group')}\n"
+        "<i>/download https://t.me/fkdhlg all</i>\n"
         "<i>/download https://t.me/fkdhlg 1 0</i>\n\n"
         f"{_t('The private group (channel) link is a random group message link')}\n\n"
         f"2. {_t('The download starts from the N message to the end of the M message')}. "
         f"{_t('When M is 0, it means the last message. The filter is optional')}\n"
         f"<i>/download https://t.me/12000000 N M [filter]</i>\n\n"
+        f"3. {_t('Download with date filter (messages from specific date)')}\n"
+        f"<i>/download https://t.me/channel all message_date>=2024-01-01</i>\n"
+        f"<i>/download https://t.me/channel 1 0 message_date>=2024-01-01</i>\n\n"
+        f"4. {_t('Download messages within date range')}\n"
+        f"<i>/download https://t.me/channel all message_date>=2024-01-01&message_date<=2024-12-31</i>\n"
+        f"<i>/download https://t.me/channel 1 0 message_date>=2024-01-01&message_date<=2024-12-31</i>\n\n"
+        f"{_t('Date formats supported')}: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS\n"
     )
 
     args = message.text.split(maxsplit=4)
-    if not message.text or len(args) < 4:
+    if not message.text or len(args) < 3:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
         )
         return
 
     url = args[1]
-    try:
-        start_offset_id = int(args[2])
-        end_offset_id = int(args[3])
-    except Exception:
+
+    # Support "all" as a shortcut for "1 0"
+    if len(args) >= 3 and args[2].lower() == "all":
+        start_offset_id = 1
+        end_offset_id = 0
+        download_filter = args[3] if len(args) > 3 else None
+    elif len(args) >= 4:
+        try:
+            start_offset_id = int(args[2])
+            end_offset_id = int(args[3])
+            download_filter = args[4] if len(args) > 4 else None
+        except Exception:
+            await client.send_message(
+                message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+            )
+            return
+    else:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
         )
@@ -684,8 +987,6 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
             )
 
         limit = end_offset_id - start_offset_id + 1
-
-    download_filter = args[4] if len(args) > 4 else None
 
     if download_filter:
         download_filter = replace_date_time(download_filter)

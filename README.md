@@ -237,6 +237,117 @@ enable_download_txt: false
 - **allowed_user_ids** - Who is allowed to use the robot? The default login account can be used. Please add single quotes to the name with @.
 - **date_format** Support custom configuration of media_datetime format in file_path_prefix.see [python-datetime](https://docs.python.org/3/library/datetime.html)
 - **enable_download_txt** Enable download txt file, default `false`
+- **download_timeout** Download timeout in seconds (0 = no timeout). Recommended: 300-600 for large files. Default: 600 seconds. See [Timeout Configuration](#timeout-configuration)
+
+## Bot Commands
+
+When using the bot (via `bot_token`), the following commands are available:
+
+### Information Commands
+
+**`/get_info <telegram_link>`** - Get detailed information about a message or channel
+```
+/get_info https://t.me/channel
+/get_info https://t.me/channel/123
+/get_info https://t.me/c/1234567890/123
+```
+
+**`/get_url <username_or_id>`** - Get the Telegram URL for a channel/group
+```
+/get_url @telegram
+/get_url telegram
+/get_url -1001234567890
+```
+
+### Download Commands
+
+**`/download <link> <start> <end> [filter]`** - Download messages with full control
+
+Examples:
+```
+# Download all messages (using "all" shortcut)
+/download https://t.me/channel all
+
+# Download all messages (traditional syntax)
+/download https://t.me/channel 1 0
+
+# Download specific message range
+/download https://t.me/channel 100 200
+
+# Download all with date filter
+/download https://t.me/channel all message_date>=2024-01-01
+
+# Download from date to now
+/download https://t.me/channel 1 0 message_date>=2024-01-01
+
+# Download date range
+/download https://t.me/channel all message_date>=2024-01-01&message_date<=2024-12-31
+```
+
+**`/dl <link> [start_date] [end_date]`** - Simplified download with date filtering
+
+Examples:
+```
+# Download all messages
+/dl https://t.me/channel
+
+# Download from date onwards
+/dl https://t.me/channel 2024-01-01
+
+# Download date range
+/dl https://t.me/channel 2024-01-01 2024-12-31
+```
+
+### Other Commands
+
+- **`/help`** - Show help message
+- **`/forward`** - Forward messages to another chat
+- **`/listen_forward`** - Set up automatic forwarding
+- **`/add_filter`** - Add download filter
+- **`/set_language`** - Change bot language (EN/ZH/RU/UA)
+- **`/stop`** - Stop current download or forward task
+
+## Timeout Configuration
+
+⚠️ **IMPORTANT:** The timeout feature is currently disabled due to compatibility issues with Pyrogram's progress callbacks.
+
+```yaml
+# Download timeout in seconds (0 = no timeout)
+# NOTE: Currently set to 0 (disabled) due to compatibility issues
+download_timeout: 0
+```
+
+**Status:** Downloads use Pyrogram's default timeout behavior. The 3-retry mechanism still works for handling errors.
+
+See `docs/TIMEOUT-ISSUE.md` for details and workarounds.
+
+## Date Filtering
+
+Both `/download` and `/dl` commands support date filtering:
+
+### Supported Date Formats
+- `YYYY-MM-DD` (e.g., 2024-01-01)
+- `YYYY-MM-DD HH:MM:SS` (e.g., 2024-01-01 14:30:00)
+- `YYYY-MM` (e.g., 2024-01)
+
+### Filter Syntax (for `/download` command)
+```
+message_date>=2024-01-01              # From date onwards
+message_date<=2024-12-31              # Up to date
+message_date>=2024-01-01&message_date<=2024-12-31  # Date range
+```
+
+### Examples
+```bash
+# Download messages from January 2024 onwards
+/download https://t.me/channel all message_date>=2024-01-01
+
+# Download messages from 2024
+/dl https://t.me/channel 2024-01-01 2024-12-31
+
+# Download messages from specific month
+/download https://t.me/channel all message_date>=2024-01-01&message_date<=2024-01-31
+```
 
 ## Execution
 
@@ -264,7 +375,137 @@ proxy:
   password: your_password(delete the line if none)
 ```
 
-If your proxy doesn’t require authorization you can omit username and password. Then the proxy will automatically be enabled.
+If your proxy doesn't require authorization you can omit username and password. Then the proxy will automatically be enabled.
+
+## Quick Reference
+
+### Common Bot Commands
+
+```bash
+# Get channel URL
+/get_url @channelname
+
+# Get message info
+/get_info https://t.me/channel/123
+
+# Download all messages (NEW shortcut!)
+/download https://t.me/channel all
+
+# Download all messages (old way still works)
+/download https://t.me/channel 1 0
+
+# Download with date filter
+/download https://t.me/channel all message_date>=2024-01-01
+
+# Simplified download from date
+/dl https://t.me/channel 2024-01-01
+
+# Download date range
+/dl https://t.me/channel 2024-01-01 2024-12-31
+```
+
+### Configuration Snippets
+
+**Basic config.yaml:**
+```yaml
+api_hash: your_api_hash
+api_id: your_api_id
+bot_token: your_bot_token  # Optional, for bot mode
+save_path: /path/to/downloads
+download_timeout: 600  # 10 minutes (recommended)
+
+media_types:
+  - audio
+  - document
+  - photo
+  - video
+  - voice
+
+file_formats:
+  audio: [all]
+  document: [all]
+  video: [all]
+```
+
+**With cleanup (auto-delete downloaded messages):**
+```yaml
+cleanup:
+  enabled: true
+  idle_hours: 3
+  delete_skipped_messages: true
+  delete_bot_status: false
+```
+
+**With date filter in chat config:**
+```yaml
+chat:
+  - chat_id: @yourchannel
+    last_read_message_id: 0
+    download_filter: date >= 2024-01-01 00:00:00 and date <= 2024-12-31 23:59:59
+```
+
+## Recent Improvements
+
+### v2.2.2 (Latest)
+
+**Bug Fixes:**
+- ✅ **Automatic TypeError fallback** - PDFs/documents now download successfully despite Pyrogram bug
+- ✅ Fixed `/get_info` command crashes with invalid URLs
+- ✅ Fixed timeout errors during downloads (proper asyncio timeout handling)
+- ✅ Improved link parsing validation
+
+**New Features:**
+- ✨ **Automatic recovery** - Downloads retry without progress callback if TypeError occurs
+- ✨ **`/get_url` command** - Get Telegram URL for any channel by username or ID
+- ✨ **`/dl` command** - Simplified download with easy date filtering
+- ✨ **"all" shortcut** - Use `/download <link> all` instead of `/download <link> 1 0`
+- ✨ **Configurable timeout** - Set `download_timeout` in config.yaml
+- ✨ **Better error messages** - Clear, actionable error messages with suggestions
+
+**Documentation:**
+- 📚 `docs/download-improvements.md` - Complete feature documentation
+- 📚 `docs/timeout-fix.md` - Timeout configuration guide
+- 📚 `docs/new-commands-reference.md` - Quick command reference
+- 📚 `docs/FIXES-SUMMARY.md` - Summary of all changes
+
+See the `docs/` folder for detailed documentation on all new features.
+
+## Troubleshooting
+
+### Download Timeouts
+
+If you see timeout errors:
+```
+ERROR - Message[17]: Timing out after 3 retries, download skipped.
+```
+
+**Solution:**
+1. Increase `download_timeout` in config.yaml:
+   ```yaml
+   download_timeout: 1200  # 20 minutes
+   ```
+2. Reduce concurrent downloads:
+   ```yaml
+   max_download_task: 3
+   max_concurrent_transmissions: 1
+   ```
+
+See `docs/timeout-fix.md` for detailed troubleshooting.
+
+### Invalid Link Errors
+
+If `/get_info` or downloads fail with link errors:
+
+**Supported formats:**
+- `https://t.me/username` - Public channel/group
+- `https://t.me/username/123` - Public channel with message
+- `https://t.me/c/1234567890/123` - Private channel (numeric ID)
+
+**Not supported:**
+- Links with usernames in private channel format
+- Invalid or malformed URLs
+
+Use `/get_url` to get the correct link format for any channel.
 
 ## Contributing
 

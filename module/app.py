@@ -408,6 +408,13 @@ class Application:
         self.date_format: str = "%Y_%m"
         self.drop_no_audio_video: bool = False
         self.enable_download_txt: bool = False
+        self.download_timeout: int = 600  # Default 10 minutes
+
+        # Cleanup configuration
+        self.cleanup_enabled: bool = True
+        self.cleanup_idle_hours: int = 3
+        self.cleanup_delete_skipped: bool = True
+        self.cleanup_delete_bot_status: bool = False
 
         self.forward_limit_call = LimitCall(max_limit_call_times=33)
 
@@ -543,6 +550,26 @@ class Application:
         self.enable_download_txt = get_config(
             _config, "enable_download_txt", self.enable_download_txt, bool
         )
+
+        self.download_timeout = get_config(
+            _config, "download_timeout", self.download_timeout, int
+        )
+
+        # Load cleanup configuration
+        cleanup_config = _config.get("cleanup", {})
+        if cleanup_config:
+            self.cleanup_enabled = get_config(
+                cleanup_config, "enabled", self.cleanup_enabled, bool, False
+            )
+            self.cleanup_idle_hours = get_config(
+                cleanup_config, "idle_hours", self.cleanup_idle_hours, int, False
+            )
+            self.cleanup_delete_skipped = get_config(
+                cleanup_config, "delete_skipped_messages", self.cleanup_delete_skipped, bool, False
+            )
+            self.cleanup_delete_bot_status = get_config(
+                cleanup_config, "delete_bot_status", self.cleanup_delete_bot_status, bool, False
+            )
 
         try:
             date = datetime(2023, 10, 31)

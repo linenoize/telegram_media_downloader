@@ -13,7 +13,6 @@ from rich.logging import RichHandler
 
 from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
 from module.bot import start_download_bot, stop_download_bot
-from module.cleanup import CleanupManager
 from module.download_stat import update_download_status
 from module.get_chat_history_v2 import get_chat_history_v2
 from module.language import _t
@@ -25,6 +24,7 @@ from module.pyrogram_extension import (
     report_bot_download_status,
     set_max_concurrent_transmissions,
     set_meta_data,
+    update_cloud_upload_stat,
     upload_telegram_chat,
 )
 from module.web import init_web
@@ -32,7 +32,6 @@ from utils.format import truncate_filename, validate_title
 from utils.log import LogFilter
 from utils.meta import print_meta
 from utils.meta_data import MetaData
-from utils.updates import check_for_updates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +47,6 @@ app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 
 queue: asyncio.Queue = asyncio.Queue()
 RETRY_TIME_OUT = 3
-cleanup_manager: Optional[CleanupManager] = None
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
@@ -236,6 +234,9 @@ async def _get_media_meta(
         if caption:
             caption = validate_title(caption)
             app.set_caption_name(chat_id, message.media_group_id, caption)
+            app.set_caption_entities(
+                chat_id, message.media_group_id, message.caption_entities
+            )
         else:
             caption = app.get_caption_name(chat_id, message.media_group_id)
 
@@ -267,6 +268,33 @@ async def add_download_task(
     return True
 
 
+async def save_msg_to_file(
+    app, chat_id: Union[int, str], message: pyrogram.types.Message
+):
+    """Write message text into file"""
+    dirname = validate_title(
+        message.chat.title if message.chat and message.chat.title else str(chat_id)
+    )
+    datetime_dir_name = message.date.strftime(app.date_format) if message.date else "0"
+
+    file_save_path = app.get_file_save_path("msg", dirname, datetime_dir_name)
+    file_name = os.path.join(
+        app.temp_save_path,
+        file_save_path,
+        f"{app.get_file_name(message.id, None, None)}.txt",
+    )
+
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+
+    if _is_exist(file_name):
+        return DownloadStatus.SkipDownload, None
+
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write(message.text or "")
+
+    return DownloadStatus.SuccessDownload, file_name
+
+
 async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
 ):
@@ -276,15 +304,13 @@ async def download_task(
         client, message, app.media_types, app.file_formats, node
     )
 
+    if app.enable_download_txt and message.text and not message.media:
+        download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
+
     if not node.bot:
         app.set_download_id(node, message.id, download_status)
 
     node.download_status[message.id] = download_status
-
-    # Update cleanup manager activity on successful downloads
-    global cleanup_manager
-    if cleanup_manager and download_status == DownloadStatus.SuccessDownload:
-        cleanup_manager.update_activity()
 
     file_size = os.path.getsize(file_name) if file_name else 0
 
@@ -303,7 +329,12 @@ async def download_task(
         not node.upload_telegram_chat_id
         and download_status is DownloadStatus.SuccessDownload
     ):
-        if await app.upload_file(file_name):
+        ui_file_name = file_name
+        if app.hide_file_name:
+            ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
+        if await app.upload_file(
+            file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
+        ):
             node.upload_success_count += 1
 
     await report_bot_download_status(
@@ -312,11 +343,6 @@ async def download_task(
         download_status,
         file_size,
     )
-
-    # Delete the message after successful download
-    if download_status is DownloadStatus.SuccessDownload:
-        await client.delete_messages(chat_id=node.chat_id, message_ids=message.id)
-
 
 
 # pylint: disable = R0915,R0914
@@ -393,13 +419,6 @@ async def download_media(
                             f"{_t('already download,download skipped')}.\n"
                         )
 
-                        # Track this message for cleanup (already downloaded)
-                        global cleanup_manager
-                        if cleanup_manager and app.cleanup_delete_skipped:
-                            cleanup_manager.add_skipped_message(
-                                node.chat_id, message.id, reason="already_downloaded"
-                            )
-
                         return DownloadStatus.SkipDownload, None
             else:
                 return DownloadStatus.SkipDownload, None
@@ -419,9 +438,6 @@ async def download_media(
 
     for retry in range(3):
         try:
-            # Note: asyncio.wait_for() can cause TypeError with progress callbacks
-            # Using simple download without timeout for now
-            # TODO: Implement timeout using a different mechanism
             temp_download_path = await client.download_media(
                 message,
                 file_name=temp_file_name,
@@ -457,94 +473,16 @@ async def download_media(
             await asyncio.sleep(wait_err.value)
             logger.warning("Message[{}]: FlowWait {}", message.id, wait_err.value)
             _check_timeout(retry, message.id)
-        except asyncio.TimeoutError:
-            # Proper timeout exception
-            timeout_val = app.download_timeout if app.download_timeout > 0 else "unknown"
+        except TypeError:
+            # pylint: disable = C0301
             logger.warning(
-                f"Message[{message.id}]: {_t('Download timed out after')} {timeout_val} {_t('seconds')}, "
-                f"{_t('retrying after')} {RETRY_TIME_OUT} {_t('seconds')} (retry {retry + 1}/3)"
-            )
-            await asyncio.sleep(RETRY_TIME_OUT)
-            if _check_timeout(retry, message.id):
-                logger.error(
-                    f"Message[{message.id}]: {_t('Timing out after 3 reties, download skipped.')} "
-                    f"Consider increasing download_timeout in config (current: {timeout_val}s)"
-                )
-        except TypeError as e:
-            # Pyrogram bug: progress callbacks fail with certain media types (PDFs, documents)
-            # Automatic fallback: retry download WITHOUT progress callback
-            try:
-                progress_args = (
-                    message_id,
-                    ui_file_name,
-                    task_start_time,
-                    node,
-                    client,
-                )
-                progress_args_types = [type(arg).__name__ for arg in progress_args]
-            except Exception:
-                progress_args = None
-                progress_args_types = None
-            logger.warning(
-                f"Message[{message.id}]: Pyrogram progress callback bug detected (TypeError: {e}). "
-                f"Retrying without progress tracking..."
-            )
-            logger.debug(
-                "Progress callback details for Message[%s]: progress=%s, progress_args_types=%s",
-                message.id,
-                getattr(update_download_status, "__name__", str(update_download_status)),
-                progress_args_types,
-            )
-
-            try:
-                # Retry download WITHOUT progress callback to bypass Pyrogram bug
-                temp_download_path = await client.download_media(
-                    message,
-                    file_name=temp_file_name,
-                    # NO progress parameter - this avoids the Pyrogram bug
-                    # NO progress_args parameter
-                )
-
-                if temp_download_path and isinstance(temp_download_path, str):
-                    _check_download_finish(media_size, temp_download_path, ui_file_name)
-                    await asyncio.sleep(0.5)
-                    _move_to_download_path(temp_download_path, file_name)
-                    logger.info(
-                        f"Message[{message.id}]: Download succeeded without progress tracking"
-                    )
-                    return DownloadStatus.SuccessDownload, file_name
-                else:
-                    logger.error(
-                        f"Message[{message.id}]: Download failed even without progress callback"
-                    )
-                    break
-
-            except Exception as fallback_error:
-                # Fallback also failed - log and retry if attempts remaining
-                logger.error(
-                    f"Message[{message.id}]: Fallback download failed: {fallback_error}"
-                )
-                if retry < 2:
-                    logger.info(
-                        f"Message[{message.id}]: Retrying... (attempt {retry + 2}/3)"
-                    )
-                    await asyncio.sleep(RETRY_TIME_OUT)
-                else:
-                    logger.error(
-                        f"Message[{message.id}]: Download failed after 3 retries and fallback attempt. "
-                        f"This message may have corrupted media or an unsupported format."
-                    )
-                    break
-        except (OSError, ConnectionError) as e:
-            # Handle connection loss errors
-            logger.warning(
-                f"Message[{message.id}]: {_t('Connection error occurred')}: {e}, "
+                f"{_t('Timeout Error occurred when downloading Message')}[{message.id}], "
                 f"{_t('retrying after')} {RETRY_TIME_OUT} {_t('seconds')}"
             )
             await asyncio.sleep(RETRY_TIME_OUT)
             if _check_timeout(retry, message.id):
                 logger.error(
-                    f"Message[{message.id}]: {_t('Connection failed after 3 retries, download skipped.')}"
+                    f"Message[{message.id}]: {_t('Timing out after 3 reties, download skipped.')}"
                 )
         except Exception as e:
             # pylint: disable = C0301
@@ -633,6 +571,9 @@ async def download_chat_task(
         if caption:
             caption = validate_title(caption)
             app.set_caption_name(node.chat_id, message.media_group_id, caption)
+            app.set_caption_entities(
+                node.chat_id, message.media_group_id, message.caption_entities
+            )
         else:
             caption = app.get_caption_name(node.chat_id, message.media_group_id)
         set_meta_data(meta_data, message, caption)
@@ -644,14 +585,15 @@ async def download_chat_task(
             await add_download_task(message, node)
         else:
             node.download_status[message.id] = DownloadStatus.SkipDownload
-            await upload_telegram_chat(
-                client,
-                node.upload_user,
-                app,
-                node,
-                message,
-                DownloadStatus.SkipDownload,
-            )
+            if message.media_group_id:
+                await upload_telegram_chat(
+                    client,
+                    node.upload_user,
+                    app,
+                    node,
+                    message,
+                    DownloadStatus.SkipDownload,
+                )
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
@@ -724,23 +666,6 @@ def main():
         app.loop.run_until_complete(start_server(client))
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
 
-        # Initialize cleanup manager
-        global cleanup_manager
-        if app.cleanup_enabled:
-            cleanup_manager = CleanupManager(
-                app=app,
-                client=client,
-                idle_timeout=app.cleanup_idle_hours * 3600,  # Convert hours to seconds
-                enabled=app.cleanup_enabled,
-            )
-            # Start cleanup background task
-            cleanup_task = app.loop.create_task(cleanup_manager.check_and_cleanup())
-            tasks.append(cleanup_task)
-            logger.info(
-                f"{_t('Cleanup manager enabled')} - "
-                f"{_t('will run after')} {app.cleanup_idle_hours} {_t('hours of inactivity')}"
-            )
-
         app.loop.create_task(download_all_chat(client))
         for _ in range(app.max_download_task):
             task = app.loop.create_task(worker(client))
@@ -757,18 +682,13 @@ def main():
         logger.exception("{}", e)
     finally:
         app.is_running = False
-
-        # Stop cleanup manager
-        if cleanup_manager:
-            cleanup_manager.stop()
-
         if app.bot_token:
             app.loop.run_until_complete(stop_download_bot())
         app.loop.run_until_complete(stop_server(client))
         for task in tasks:
             task.cancel()
         logger.info(_t("Stopped!"))
-        check_for_updates(app.proxy)
+        # check_for_updates(app.proxy)
         logger.info(f"{_t('update config')}......")
         app.update_config()
         logger.success(
