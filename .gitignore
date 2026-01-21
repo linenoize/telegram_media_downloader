@@ -98,4 +98,6 @@ hive-mind-prompt-*.txt
 CLAUDE.md
 .claude/*
 docs/*
+!docs/COMMAND-SYNTAX.md
+!docs/QUICK_START.md
 tmpclaude-*

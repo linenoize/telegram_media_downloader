@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import time
 from typing import List, Optional, Tuple, Union
@@ -161,6 +162,95 @@ def _is_exist(file_path: str) -> bool:
     return not os.path.isdir(file_path) and os.path.exists(file_path)
 
 
+_URL_REGEX = re.compile(r"https?://[^\s)]+")
+
+
+def _normalize_text_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _matches_text_filter(value: str, text_filter: str) -> bool:
+    if not text_filter:
+        return True
+    return text_filter.lower() in value.lower()
+
+
+def _extract_urls_from_entities(text: Optional[str], entities) -> List[str]:
+    if not text or not entities:
+        return []
+    urls: List[str] = []
+    for entity in entities:
+        if entity.type == pyrogram.enums.MessageEntityType.TEXT_LINK and entity.url:
+            urls.append(entity.url)
+        elif entity.type == pyrogram.enums.MessageEntityType.URL:
+            start = entity.offset
+            end = start + entity.length
+            urls.append(text[start:end])
+    return urls
+
+
+def _extract_urls_from_text(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+    return _URL_REGEX.findall(text)
+
+
+def _collect_text_outputs(
+    message: pyrogram.types.Message, text_filter: str, mode: str
+) -> List[str]:
+    outputs: List[str] = []
+    seen = set()
+
+    if mode in ["text", "both"]:
+        for text_part in [message.text, message.caption]:
+            if not text_part:
+                continue
+            if _matches_text_filter(text_part, text_filter):
+                normalized = _normalize_text_line(text_part)
+                if normalized and normalized not in seen:
+                    outputs.append(normalized)
+                    seen.add(normalized)
+
+    if mode in ["urls", "both"]:
+        urls = []
+        urls.extend(_extract_urls_from_text(message.text))
+        urls.extend(_extract_urls_from_text(message.caption))
+        urls.extend(_extract_urls_from_entities(message.text, message.entities))
+        urls.extend(_extract_urls_from_entities(message.caption, message.caption_entities))
+        for url in urls:
+            if _matches_text_filter(url, text_filter) and url not in seen:
+                outputs.append(url)
+                seen.add(url)
+
+    return outputs
+
+
+def _get_text_log_path(
+    app: Application, node: TaskNode, message: pyrogram.types.Message
+) -> str:
+    dirname = validate_title(
+        message.chat.title if message.chat and message.chat.title else str(node.chat_id)
+    )
+    datetime_dir_name = message.date.strftime(app.date_format) if message.date else "0"
+    file_save_path = app.get_file_save_path("text", dirname, datetime_dir_name)
+    if node.text_output_mode == "urls":
+        file_name = "text-dl-urls.txt"
+    elif node.text_output_mode == "both":
+        file_name = "text-dl-both.txt"
+    else:
+        file_name = "text-dl.txt"
+    os.makedirs(file_save_path, exist_ok=True)
+    return os.path.join(file_save_path, file_name)
+
+
+def _append_text_lines(file_path: str, lines: List[str]) -> None:
+    if not lines:
+        return
+    with open(file_path, "a", encoding="utf-8") as file_handle:
+        for line in lines:
+            file_handle.write(f"{line}\n")
+
+
 # pylint: disable = R0912
 
 
@@ -271,9 +361,10 @@ async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
 ):
     """Download and Forward media"""
-
+    media_types = node.media_types_override or app.media_types
+    file_formats = node.file_formats_override or app.file_formats
     download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
+        client, message, media_types, file_formats, node
     )
 
     if not node.bot:
@@ -617,7 +708,7 @@ async def download_chat_task(
 
     chat_download_config.node = node
 
-    if chat_download_config.ids_to_retry:
+    if chat_download_config.ids_to_retry and not node.text_download:
         logger.info(f"{_t('Downloading files failed during last run')}...")
         skipped_messages: list = await client.get_messages(  # type: ignore
             chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
@@ -638,6 +729,25 @@ async def download_chat_task(
         set_meta_data(meta_data, message, caption)
 
         if app.need_skip_message(chat_download_config, message.id):
+            continue
+
+        if node.is_stop_transmission:
+            break
+
+        if node.text_download:
+            node.total_task += 1
+            if app.exec_filter(chat_download_config, meta_data):
+                outputs = _collect_text_outputs(
+                    message, node.text_filter or "", node.text_output_mode
+                )
+                if outputs:
+                    file_path = _get_text_log_path(app, node, message)
+                    _append_text_lines(file_path, outputs)
+                    node.stat(DownloadStatus.SuccessDownload)
+                else:
+                    node.stat(DownloadStatus.SkipDownload)
+            else:
+                node.stat(DownloadStatus.SkipDownload)
             continue
 
         if app.exec_filter(chat_download_config, meta_data):
@@ -733,6 +843,7 @@ def main():
                 idle_timeout=app.cleanup_idle_hours * 3600,  # Convert hours to seconds
                 enabled=app.cleanup_enabled,
             )
+            app.cleanup_manager = cleanup_manager
             # Start cleanup background task
             cleanup_task = app.loop.create_task(cleanup_manager.check_and_cleanup())
             tasks.append(cleanup_task)

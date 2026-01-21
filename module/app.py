@@ -127,6 +127,8 @@ class TaskNode:
         upload_telegram_chat_id: Union[int, str] = None,
         has_protected_content: bool = False,
         download_filter: str = None,
+        media_types_override: Optional[List[str]] = None,
+        file_formats_override: Optional[dict] = None,
         limit: int = 0,
         start_offset_id: int = 0,
         end_offset_id: int = 0,
@@ -134,6 +136,9 @@ class TaskNode:
         task_type: TaskType = TaskType.Download,
         task_id: int = 0,
         topic_id: int = 0,
+        text_download: bool = False,
+        text_filter: Optional[str] = None,
+        text_output_mode: str = "text",
     ):
         self.chat_id = chat_id
         self.from_user_id = from_user_id
@@ -142,6 +147,8 @@ class TaskNode:
         self.reply_message = replay_message
         self.has_protected_content = has_protected_content
         self.download_filter = download_filter
+        self.media_types_override = media_types_override
+        self.file_formats_override = file_formats_override
         self.limit = limit
         self.start_offset_id = start_offset_id
         self.end_offset_id = end_offset_id
@@ -173,6 +180,9 @@ class TaskNode:
         self.topic_id = topic_id
         self.reply_to_message = None
         self.cloud_drive_upload_stat_dict: dict = {}
+        self.text_download = text_download
+        self.text_filter = text_filter
+        self.text_output_mode = text_output_mode
 
     def skip_msg_id(self, msg_id: int):
         """Skip if message id out of range"""
@@ -415,6 +425,7 @@ class Application:
         self.cleanup_idle_hours: int = 3
         self.cleanup_delete_skipped: bool = True
         self.cleanup_delete_bot_status: bool = False
+        self.cleanup_manager = None
 
         self.forward_limit_call = LimitCall(max_limit_call_times=33)
 

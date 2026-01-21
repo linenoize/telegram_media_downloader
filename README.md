@@ -237,7 +237,7 @@ enable_download_txt: false
 - **allowed_user_ids** - Who is allowed to use the robot? The default login account can be used. Please add single quotes to the name with @.
 - **date_format** Support custom configuration of media_datetime format in file_path_prefix.see [python-datetime](https://docs.python.org/3/library/datetime.html)
 - **enable_download_txt** Enable download txt file, default `false`
-- **download_timeout** Download timeout in seconds (0 = no timeout). Recommended: 300-600 for large files. Default: 600 seconds. See [Timeout Configuration](#timeout-configuration)
+- **download_timeout** Download timeout in seconds. **Currently not enforced** due to Pyrogram progress callback issues; the value is stored for future use. See [Timeout Configuration](#timeout-configuration)
 
 ## Bot Commands
 
@@ -301,6 +301,7 @@ Examples:
 ### Other Commands
 
 - **`/help`** - Show help message
+- **`/text_dl`** - Download message text or URLs with filters
 - **`/forward`** - Forward messages to another chat
 - **`/listen_forward`** - Set up automatic forwarding
 - **`/add_filter`** - Add download filter
@@ -309,26 +310,26 @@ Examples:
 
 ## Timeout Configuration
 
-⚠️ **IMPORTANT:** The timeout feature is currently disabled due to compatibility issues with Pyrogram's progress callbacks.
+⚠️ **IMPORTANT:** The timeout feature is currently not enforced due to compatibility issues with Pyrogram's progress callbacks.
 
 ```yaml
 # Download timeout in seconds (0 = no timeout)
-# NOTE: Currently set to 0 (disabled) due to compatibility issues
-download_timeout: 0
+# NOTE: This setting is currently not enforced due to compatibility issues
+download_timeout: 600
 ```
 
-**Status:** Downloads use Pyrogram's default timeout behavior. The 3-retry mechanism still works for handling errors.
+**Status:** Downloads currently run without an explicit timeout in the downloader code. The value is retained for future use.
 
-See `docs/TIMEOUT-ISSUE.md` for details and workarounds.
+See `docs/TIMEOUT-ISSUE.md` for background details.
 
 ## Date Filtering
 
-Both `/download` and `/dl` commands support date filtering:
+Both `/download` and `/dl` commands support date filtering.
 
 ### Supported Date Formats
 - `YYYY-MM-DD` (e.g., 2024-01-01)
-- `YYYY-MM-DD HH:MM:SS` (e.g., 2024-01-01 14:30:00)
 - `YYYY-MM` (e.g., 2024-01)
+- `YYYY-MM-DD HH:MM:SS` is supported in `config.yaml` filters (bot commands split on spaces)
 
 ### Filter Syntax (for `/download` command)
 ```
@@ -354,6 +355,9 @@ message_date>=2024-01-01&message_date<=2024-12-31  # Date range
 ```sh
 python3 media_downloader.py
 ```
+
+**Note:** `media_downloader.py` deletes successfully downloaded messages from the source chat.
+If you want to keep messages, run `python3 media_downloader-no-delete.py` instead.
 
 All downloaded media will be stored at the root of `save_path`.
 The specific location reference is as follows:
@@ -412,7 +416,7 @@ api_hash: your_api_hash
 api_id: your_api_id
 bot_token: your_bot_token  # Optional, for bot mode
 save_path: /path/to/downloads
-download_timeout: 600  # 10 minutes (recommended)
+download_timeout: 600  # stored but not enforced yet
 
 media_types:
   - audio
@@ -427,7 +431,7 @@ file_formats:
   video: [all]
 ```
 
-**With cleanup (auto-delete downloaded messages):**
+**With cleanup (auto-delete skipped/bot-status messages after idle):**
 ```yaml
 cleanup:
   enabled: true
@@ -441,7 +445,7 @@ cleanup:
 chat:
   - chat_id: @yourchannel
     last_read_message_id: 0
-    download_filter: date >= 2024-01-01 00:00:00 and date <= 2024-12-31 23:59:59
+    download_filter: message_date >= 2024-01-01 00:00:00 and message_date <= 2024-12-31 23:59:59
 ```
 
 ## Recent Improvements
@@ -451,7 +455,6 @@ chat:
 **Bug Fixes:**
 - ✅ **Automatic TypeError fallback** - PDFs/documents now download successfully despite Pyrogram bug
 - ✅ Fixed `/get_info` command crashes with invalid URLs
-- ✅ Fixed timeout errors during downloads (proper asyncio timeout handling)
 - ✅ Improved link parsing validation
 
 **New Features:**
@@ -459,7 +462,7 @@ chat:
 - ✨ **`/get_url` command** - Get Telegram URL for any channel by username or ID
 - ✨ **`/dl` command** - Simplified download with easy date filtering
 - ✨ **"all" shortcut** - Use `/download <link> all` instead of `/download <link> 1 0`
-- ✨ **Configurable timeout** - Set `download_timeout` in config.yaml
+- ✨ **Configurable timeout (stored)** - Set `download_timeout` in config.yaml for future use
 - ✨ **Better error messages** - Clear, actionable error messages with suggestions
 
 **Documentation:**
@@ -474,23 +477,14 @@ See the `docs/` folder for detailed documentation on all new features.
 
 ### Download Timeouts
 
-If you see timeout errors:
+The downloader currently does not enforce `download_timeout`. If you see
+retry-exhausted messages such as:
 ```
 ERROR - Message[17]: Timing out after 3 retries, download skipped.
 ```
+they typically indicate network/Telegram errors rather than the configured timeout value.
 
-**Solution:**
-1. Increase `download_timeout` in config.yaml:
-   ```yaml
-   download_timeout: 1200  # 20 minutes
-   ```
-2. Reduce concurrent downloads:
-   ```yaml
-   max_download_task: 3
-   max_concurrent_transmissions: 1
-   ```
-
-See `docs/timeout-fix.md` for detailed troubleshooting.
+See `docs/timeout-fix.md` for details and workarounds.
 
 ### Invalid Link Errors
 

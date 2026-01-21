@@ -3,7 +3,7 @@
 import asyncio
 import os
 from datetime import datetime
-from typing import Callable, List, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import pyrogram
 from loguru import logger
@@ -41,6 +41,175 @@ from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
 # pylint: disable = C0301, R0902
+
+SUPPORTED_MEDIA_TYPES = [
+    "audio",
+    "document",
+    "photo",
+    "video",
+    "voice",
+    "animation",
+    "video_note",
+]
+
+CATEGORY_ALIASES = {
+    "image": ["photo"],
+    "images": ["photo"],
+    "photo": ["photo"],
+    "photos": ["photo"],
+    "document": ["document"],
+    "documents": ["document"],
+    "doc": ["document"],
+    "docs": ["document"],
+    "video": ["video"],
+    "videos": ["video"],
+    "audio": ["audio"],
+    "audios": ["audio"],
+    "voice": ["voice"],
+    "voices": ["voice"],
+    "animation": ["animation"],
+    "animations": ["animation"],
+    "gif": ["animation"],
+    "gifs": ["animation"],
+    "video_note": ["video_note"],
+    "videonote": ["video_note"],
+}
+
+
+def _is_filter_token(token: str) -> bool:
+    return any(op in token for op in ["<=", ">=", "==", "!=", ">", "<", "&", "|"])
+
+
+def _normalize_extension(ext: str) -> Optional[str]:
+    if not ext:
+        return None
+    ext = ext.strip().lower()
+    if ext.startswith("."):
+        ext = ext[1:]
+    return ext or None
+
+
+def _get_all_media_types(app: Application) -> List[str]:
+    media_types = list(app.media_types) if app and app.media_types else []
+    for media_type in SUPPORTED_MEDIA_TYPES:
+        if media_type not in media_types:
+            media_types.append(media_type)
+    return media_types
+
+
+def _reply_parameters(message: pyrogram.types.Message) -> types.ReplyParameters:
+    return types.ReplyParameters(message_id=message.id)
+
+
+def _track_bot_status_message(
+    app: Optional[Application], chat_id: Union[int, str], message_id: int
+):
+    if not app or not app.cleanup_delete_bot_status:
+        return
+    cleanup_manager = getattr(app, "cleanup_manager", None)
+    if cleanup_manager:
+        cleanup_manager.add_bot_status_message(chat_id, message_id)
+
+
+def _parse_selector_flags(
+    tokens: List[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
+    selector = None
+    selector_mode = None
+    error = None
+    remaining: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token.startswith("--type="):
+            selector = token.split("=", 1)[1]
+            selector_mode = "type"
+        elif token.startswith("--ext="):
+            selector = token.split("=", 1)[1]
+            selector_mode = "ext"
+        elif token in ["--type", "--ext"]:
+            if idx + 1 >= len(tokens):
+                error = f"{token} requires a value"
+                break
+            selector = tokens[idx + 1]
+            selector_mode = "type" if token == "--type" else "ext"
+            idx += 1
+        else:
+            remaining.append(token)
+        idx += 1
+    return selector, selector_mode, error, remaining
+
+
+def _parse_text_dl_flags(tokens: List[str]) -> Tuple[str, Optional[str], List[str]]:
+    mode = "text"
+    mode_flag = None
+    remaining: List[str] = []
+    for token in tokens:
+        if token in ["--urls", "--url"]:
+            if mode_flag and mode_flag != "urls":
+                return mode, "Please provide only one output mode flag.", tokens
+            mode = "urls"
+            mode_flag = "urls"
+        elif token == "--both":
+            if mode_flag and mode_flag != "both":
+                return mode, "Please provide only one output mode flag.", tokens
+            mode = "both"
+            mode_flag = "both"
+        elif token == "--text":
+            if mode_flag and mode_flag != "text":
+                return mode, "Please provide only one output mode flag.", tokens
+            mode = "text"
+            mode_flag = "text"
+        else:
+            remaining.append(token)
+    return mode, None, remaining
+
+
+def _resolve_selector(
+    app: Application, selector: Optional[str], selector_mode: Optional[str]
+) -> Tuple[Optional[List[str]], Optional[dict], Optional[str], Optional[str]]:
+    if not selector:
+        return None, None, None, None
+
+    selector = selector.strip()
+    selector_lower = selector.lower()
+
+    if selector_mode == "type":
+        category = CATEGORY_ALIASES.get(selector_lower)
+        if category:
+            return category, None, None, None
+        if selector_lower in SUPPORTED_MEDIA_TYPES:
+            return [selector_lower], None, None, None
+        return None, None, None, f"Unknown category: {selector}"
+
+    if selector_mode == "ext":
+        ext = _normalize_extension(selector)
+        if not ext:
+            return None, None, None, f"Invalid extension: {selector}"
+        media_types = _get_all_media_types(app)
+        file_formats_override = {
+            "audio": ["all"],
+            "document": ["all"],
+            "video": ["all"],
+        }
+        ext_filter = f"file_extension == '{ext}'"
+        return media_types, file_formats_override, ext_filter, None
+
+    if selector_lower in CATEGORY_ALIASES or selector_lower in SUPPORTED_MEDIA_TYPES:
+        category = CATEGORY_ALIASES.get(selector_lower, [selector_lower])
+        return category, None, None, None
+
+    ext = _normalize_extension(selector)
+    if not ext:
+        return None, None, None, f"Invalid selector: {selector}"
+    media_types = _get_all_media_types(app)
+    file_formats_override = {
+        "audio": ["all"],
+        "document": ["all"],
+        "video": ["all"],
+    }
+    ext_filter = f"file_extension == '{ext}'"
+    return media_types, file_formats_override, ext_filter, None
 
 
 class DownloadBot:
@@ -165,6 +334,10 @@ class DownloadBot:
                 ),
             ),
             types.BotCommand(
+                "text_dl",
+                _t("Download message text or urls with filters: /text_dl <link> ..."),
+            ),
+            types.BotCommand(
                 "dl",
                 _t("Simplified download with date filtering: /dl <link> [start_date] [end_date]")
             ),
@@ -222,6 +395,13 @@ class DownloadBot:
             MessageHandler(
                 download_from_bot,
                 filters=pyrogram.filters.command(["download"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                text_download_from_bot,
+                filters=pyrogram.filters.command(["text_dl", "text-dl"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
@@ -410,6 +590,7 @@ async def send_help_str(client: pyrogram.Client, chat_id):
         f"/help - {_t('Show available commands')}\n"
         f"/get_info - {_t('Get group and user info from message link')}\n"
         f"/download - {_t('Download messages')}\n"
+        f"/text_dl - {_t('Download message text or urls')}\n"
         f"/forward - {_t('Forward messages')}\n"
         f"/listen_forward - {_t('Listen for forwarded messages')}\n"
         f"/forward_to_comments - {_t('Forward a specific media to a comment section')}\n"
@@ -598,7 +779,7 @@ async def get_channel_url(client: pyrogram.Client, message: pyrogram.types.Messa
             await client.send_message(
                 message.from_user.id,
                 _t("Could not find the channel/group. Make sure you have access to it."),
-                reply_to_message_id=message.id
+                reply_parameters=_reply_parameters(message),
             )
             return
 
@@ -644,7 +825,7 @@ async def get_channel_url(client: pyrogram.Client, message: pyrogram.types.Messa
             message.from_user.id,
             msg,
             parse_mode=pyrogram.enums.ParseMode.HTML,
-            reply_to_message_id=message.id
+            reply_parameters=_reply_parameters(message),
         )
 
     except Exception as e:
@@ -662,7 +843,7 @@ async def get_channel_url(client: pyrogram.Client, message: pyrogram.types.Messa
             message.from_user.id,
             msg,
             parse_mode=pyrogram.enums.ParseMode.HTML,
-            reply_to_message_id=message.id
+            reply_parameters=_reply_parameters(message),
         )
 
 
@@ -711,7 +892,14 @@ async def direct_download(
 
     replay_message = "Direct download..."
     last_reply_message = await download_bot.bot.send_message(
-        message.from_user.id, replay_message, reply_to_message_id=message.id
+        message.from_user.id,
+        replay_message,
+        reply_parameters=_reply_parameters(message),
+    )
+    _track_bot_status_message(
+        _bot.app if download_bot else None,
+        message.from_user.id,
+        last_reply_message.id,
     )
 
     node = TaskNode(
@@ -800,10 +988,10 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
             if download_message:
                 await direct_download(_bot, entity.id, message, download_message)
             else:
-                client.send_message(
+                await client.send_message(
                     message.from_user.id,
                     f"{_t('From')} {entity.title} {_t('download')} {message_id} {_t('error')}!",
-                    reply_to_message_id=message.id,
+                    reply_parameters=_reply_parameters(message),
                 )
         return
 
@@ -823,19 +1011,21 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
     """
 
     args = message.text.split()
+    help_msg = (
+        f"{_t('Download messages with optional date filtering')}:\n\n"
+        f"<b>{_t('Usage')}:</b>\n"
+        f"<i>/dl https://t.me/channel</i> - {_t('Download all messages')}\n"
+        f"<i>/dl https://t.me/channel 2024-01-01</i> - {_t('Download from date onwards')}\n"
+        f"<i>/dl https://t.me/channel 2024-01-01 2024-12-31</i> - {_t('Download date range')}\n"
+        f"<i>/dl https://t.me/channel images</i> - {_t('Download only image media types')}\n"
+        f"<i>/dl https://t.me/channel --ext .epub</i> - {_t('Download only matching extensions')}\n\n"
+        f"<b>{_t('Date formats')}:</b>\n"
+        f"• YYYY-MM-DD\n"
+        f"• YYYY-MM-DD HH:MM:SS\n"
+        f"• YYYY-MM\n"
+    )
 
     if len(args) < 2:
-        help_msg = (
-            f"{_t('Download messages with optional date filtering')}:\n\n"
-            f"<b>{_t('Usage')}:</b>\n"
-            f"<i>/dl https://t.me/channel</i> - {_t('Download all messages')}\n"
-            f"<i>/dl https://t.me/channel 2024-01-01</i> - {_t('Download from date onwards')}\n"
-            f"<i>/dl https://t.me/channel 2024-01-01 2024-12-31</i> - {_t('Download date range')}\n\n"
-            f"<b>{_t('Date formats')}:</b>\n"
-            f"• YYYY-MM-DD\n"
-            f"• YYYY-MM-DD HH:MM:SS\n"
-            f"• YYYY-MM\n"
-        )
         await client.send_message(
             message.from_user.id,
             help_msg,
@@ -844,8 +1034,65 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
         return
 
     url = args[1]
-    start_date = args[2] if len(args) > 2 else None
-    end_date = args[3] if len(args) > 3 else None
+    selector_flag, selector_mode, selector_err, remaining = _parse_selector_flags(
+        args[2:]
+    )
+    if selector_err:
+        await client.send_message(
+            message.from_user.id,
+            f"{selector_err}\n\n{help_msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    date_tokens: List[str] = []
+    selector_positional = None
+    for token in remaining:
+        if token and token[0].isdigit():
+            date_tokens.append(token)
+        elif selector_positional is None:
+            selector_positional = token
+        else:
+            await client.send_message(
+                message.from_user.id,
+                help_msg,
+                parse_mode=pyrogram.enums.ParseMode.HTML,
+            )
+            return
+
+    if len(date_tokens) > 2:
+        await client.send_message(
+            message.from_user.id,
+            help_msg,
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    if selector_flag and selector_positional:
+        await client.send_message(
+            message.from_user.id,
+            f"{_t('Please provide only one selector (positional or flag).')}\n\n{help_msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    selector = selector_flag or selector_positional
+    (
+        media_types_override,
+        file_formats_override,
+        extension_filter,
+        selector_err,
+    ) = _resolve_selector(_bot.app, selector, selector_mode)
+    if selector_err:
+        await client.send_message(
+            message.from_user.id,
+            f"{selector_err}\n\n{help_msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    start_date = date_tokens[0] if len(date_tokens) > 0 else None
+    end_date = date_tokens[1] if len(date_tokens) > 1 else None
 
     # Build filter string
     download_filter = None
@@ -855,6 +1102,11 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
         if end_date:
             end_date = replace_date_time(end_date)
             download_filter += f"&message_date<={end_date}"
+    if extension_filter:
+        if download_filter:
+            download_filter = f"{download_filter}&{extension_filter}"
+        else:
+            download_filter = extension_filter
 
     # Validate filter if provided
     if download_filter:
@@ -863,7 +1115,7 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
             await client.send_message(
                 message.from_user.id,
                 f"{_t('Invalid date format')}. {err}",
-                reply_to_message_id=message.id
+                reply_parameters=_reply_parameters(message),
             )
             return
 
@@ -873,7 +1125,7 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
             await client.send_message(
                 message.from_user.id,
                 _t("Invalid Telegram link. Please provide a valid channel/group link."),
-                reply_to_message_id=message.id
+                reply_parameters=_reply_parameters(message),
             )
             return
 
@@ -882,7 +1134,7 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
             await client.send_message(
                 message.from_user.id,
                 _t("Could not access the chat. Make sure the bot has access to it."),
-                reply_to_message_id=message.id
+                reply_parameters=_reply_parameters(message),
             )
             return
 
@@ -900,8 +1152,9 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
         last_reply_message = await client.send_message(
             message.from_user.id,
             reply_message,
-            reply_to_message_id=message.id
+            reply_parameters=_reply_parameters(message),
         )
+        _track_bot_status_message(_bot.app, message.from_user.id, last_reply_message.id)
 
         node = TaskNode(
             chat_id=entity.id,
@@ -914,6 +1167,8 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
             bot=_bot.bot,
             task_id=_bot.gen_task_id(),
         )
+        node.media_types_override = media_types_override
+        node.file_formats_override = file_formats_override
         _bot.add_task_node(node)
         _bot.app.loop.create_task(
             _bot.download_chat_task(_bot.client, chat_download_config, node)
@@ -924,8 +1179,162 @@ async def download_with_date_prompt(client: pyrogram.Client, message: pyrogram.t
         await client.send_message(
             message.from_user.id,
             f"{_t('Error starting download')}:\n{str(e)}",
-            reply_to_message_id=message.id
+            reply_parameters=_reply_parameters(message),
         )
+
+
+async def text_download_from_bot(client: pyrogram.Client, message: pyrogram.types.Message):
+    """Download message text or urls from bot"""
+    msg = (
+        f"{_t('Parameter error, please enter according to the reference format')}:\n\n"
+        f"1. {_t('Download message text')}\n"
+        "<i>/text_dl https://t.me/channel all non-fiction</i>\n"
+        "<i>/text_dl https://t.me/channel 1 0 non-fiction</i>\n\n"
+        f"2. {_t('Download urls only')}\n"
+        "<i>/text_dl https://t.me/channel all --urls rapid-links.net</i>\n\n"
+        f"3. {_t('Download text and urls')}\n"
+        "<i>/text_dl https://t.me/channel all --both non-fiction</i>\n\n"
+        f"4. {_t('With date filter')}\n"
+        "<i>/text_dl https://t.me/channel all message_date>=2024-01-01 non-fiction</i>\n"
+    )
+
+    args = message.text.split()
+    if not message.text or len(args) < 3:
+        await client.send_message(
+            message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    url = args[1]
+
+    if len(args) >= 3 and args[2].lower() == "all":
+        start_offset_id = 1
+        end_offset_id = 0
+        remaining = args[3:]
+    elif len(args) >= 4:
+        try:
+            start_offset_id = int(args[2])
+            end_offset_id = int(args[3])
+            remaining = args[4:]
+        except Exception:
+            await client.send_message(
+                message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+            )
+            return
+    else:
+        await client.send_message(
+            message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    mode, mode_err, remaining = _parse_text_dl_flags(remaining)
+    if mode_err:
+        await client.send_message(
+            message.from_user.id, f"{mode_err}\n\n{msg}", parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    download_filter = None
+    text_filter = None
+    for token in remaining:
+        if _is_filter_token(token) and download_filter is None:
+            download_filter = token
+        elif text_filter is None:
+            text_filter = token
+        else:
+            await client.send_message(
+                message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+            )
+            return
+
+    if not text_filter:
+        await client.send_message(
+            message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    if download_filter:
+        download_filter = replace_date_time(download_filter)
+        res, err = _bot.filter.check_filter(download_filter)
+        if not res:
+            await client.send_message(
+                message.from_user.id,
+                err,
+                reply_parameters=_reply_parameters(message),
+            )
+            return
+
+    try:
+        chat_id, _, _ = await parse_link(_bot.client, url)
+        if not chat_id:
+            await client.send_message(
+                message.from_user.id,
+                _t("Invalid Telegram link. Please provide a valid channel/group link."),
+                reply_parameters=_reply_parameters(message),
+            )
+            return
+
+        entity = await _bot.client.get_chat(chat_id)
+        if not entity:
+            await client.send_message(
+                message.from_user.id,
+                _t("Could not access the chat. Make sure the bot has access to it."),
+                reply_parameters=_reply_parameters(message),
+            )
+            return
+
+        chat_title = entity.title
+        chat_download_config = ChatDownloadConfig()
+        chat_download_config.last_read_message_id = start_offset_id
+        chat_download_config.download_filter = download_filter
+
+        reply_message = f"from {chat_title} "
+        if download_filter:
+            reply_message += f"downloading text with filter: {download_filter}"
+        else:
+            reply_message += "downloading text"
+
+        last_reply_message = await client.send_message(
+            message.from_user.id,
+            reply_message,
+            reply_parameters=_reply_parameters(message),
+        )
+        _track_bot_status_message(_bot.app, message.from_user.id, last_reply_message.id)
+
+        limit = 0
+        if end_offset_id:
+            if end_offset_id < start_offset_id:
+                raise ValueError(
+                    f"end_offset_id < start_offset_id, {end_offset_id} < {start_offset_id}"
+                )
+            limit = end_offset_id - start_offset_id + 1
+
+        node = TaskNode(
+            chat_id=entity.id,
+            from_user_id=message.from_user.id,
+            reply_message_id=last_reply_message.id,
+            replay_message=reply_message,
+            limit=limit,
+            start_offset_id=start_offset_id,
+            end_offset_id=end_offset_id,
+            bot=_bot.bot,
+            task_id=_bot.gen_task_id(),
+            text_download=True,
+            text_filter=text_filter,
+            text_output_mode=mode,
+        )
+        _bot.add_task_node(node)
+        _bot.app.loop.create_task(
+            _bot.download_chat_task(_bot.client, chat_download_config, node)
+        )
+    except Exception as e:
+        await client.send_message(
+            message.from_user.id,
+            f"{_t('chat input error, please enter the channel or group link')}\n\n"
+            f"{_t('Error type')}: {e.__class__}"
+            f"{_t('Exception message')}: {e}",
+        )
+        return
 
 
 async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Message):
@@ -946,10 +1355,14 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
         f"4. {_t('Download messages within date range')}\n"
         f"<i>/download https://t.me/channel all message_date>=2024-01-01&message_date<=2024-12-31</i>\n"
         f"<i>/download https://t.me/channel 1 0 message_date>=2024-01-01&message_date<=2024-12-31</i>\n\n"
+        f"5. {_t('Download only a category or extension')}\n"
+        f"<i>/download https://t.me/channel all images</i>\n"
+        f"<i>/download https://t.me/channel all --type documents</i>\n"
+        f"<i>/download https://t.me/channel all --ext .epub</i>\n\n"
         f"{_t('Date formats supported')}: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS\n"
     )
 
-    args = message.text.split(maxsplit=4)
+    args = message.text.split()
     if not message.text or len(args) < 3:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
@@ -962,12 +1375,12 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
     if len(args) >= 3 and args[2].lower() == "all":
         start_offset_id = 1
         end_offset_id = 0
-        download_filter = args[3] if len(args) > 3 else None
+        remaining = args[3:]
     elif len(args) >= 4:
         try:
             start_offset_id = int(args[2])
             end_offset_id = int(args[3])
-            download_filter = args[4] if len(args) > 4 else None
+            remaining = args[4:]
         except Exception:
             await client.send_message(
                 message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
@@ -976,6 +1389,53 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
     else:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    selector_flag, selector_mode, selector_err, remaining = _parse_selector_flags(
+        remaining
+    )
+    if selector_err:
+        await client.send_message(
+            message.from_user.id,
+            f"{selector_err}\n\n{msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    download_filter = None
+    selector_positional = None
+    for token in remaining:
+        if _is_filter_token(token) and download_filter is None:
+            download_filter = token
+        elif selector_positional is None:
+            selector_positional = token
+        else:
+            await client.send_message(
+                message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+            )
+            return
+
+    if selector_flag and selector_positional:
+        await client.send_message(
+            message.from_user.id,
+            f"{_t('Please provide only one selector (positional or flag).')}\n\n{msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
+        )
+        return
+
+    selector = selector_flag or selector_positional
+    (
+        media_types_override,
+        file_formats_override,
+        extension_filter,
+        selector_err,
+    ) = _resolve_selector(_bot.app, selector, selector_mode)
+    if selector_err:
+        await client.send_message(
+            message.from_user.id,
+            f"{selector_err}\n\n{msg}",
+            parse_mode=pyrogram.enums.ParseMode.HTML,
         )
         return
 
@@ -990,10 +1450,18 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
 
     if download_filter:
         download_filter = replace_date_time(download_filter)
+    if extension_filter:
+        if download_filter:
+            download_filter = f"{download_filter}&{extension_filter}"
+        else:
+            download_filter = extension_filter
+    if download_filter:
         res, err = _bot.filter.check_filter(download_filter)
         if not res:
             await client.send_message(
-                message.from_user.id, err, reply_to_message_id=message.id
+                message.from_user.id,
+                err,
+                reply_parameters=_reply_parameters(message),
             )
             return
     try:
@@ -1010,7 +1478,12 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
                 f"download message id = {start_offset_id} - {end_offset_id} !"
             )
             last_reply_message = await client.send_message(
-                message.from_user.id, reply_message, reply_to_message_id=message.id
+                message.from_user.id,
+                reply_message,
+                reply_parameters=_reply_parameters(message),
+            )
+            _track_bot_status_message(
+                _bot.app, message.from_user.id, last_reply_message.id
             )
             node = TaskNode(
                 chat_id=entity.id,
@@ -1023,6 +1496,8 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
                 bot=_bot.bot,
                 task_id=_bot.gen_task_id(),
             )
+            node.media_types_override = media_types_override
+            node.file_formats_override = file_formats_override
             _bot.add_task_node(node)
             _bot.app.loop.create_task(
                 _bot.download_chat_task(_bot.client, chat_download_config, node)
@@ -1070,7 +1545,7 @@ async def get_forward_task_node(
         await client.send_message(
             message.from_user.id,
             _t("Invalid chat link") + f"{src_chat_id} {dst_chat_id}",
-            reply_to_message_id=message.id,
+            reply_parameters=_reply_parameters(message),
         )
         return None
 
@@ -1081,7 +1556,7 @@ async def get_forward_task_node(
         await client.send_message(
             message.from_user.id,
             f"{_t('Invalid chat link')} {e}",
-            reply_to_message_id=message.id,
+            reply_parameters=_reply_parameters(message),
         )
         logger.exception(f"get chat error: {e}")
         return None
@@ -1092,7 +1567,7 @@ async def get_forward_task_node(
         await client.send_message(
             message.from_user.id,
             _t("Cannot be forwarded to this bot, will cause an infinite loop"),
-            reply_to_message_id=message.id,
+            reply_parameters=_reply_parameters(message),
         )
         return None
 
@@ -1101,14 +1576,17 @@ async def get_forward_task_node(
         res, err = _bot.filter.check_filter(download_filter)
         if not res:
             await client.send_message(
-                message.from_user.id, err, reply_to_message_id=message.id
+                message.from_user.id,
+                err,
+                reply_parameters=_reply_parameters(message),
             )
 
     last_reply_message = await client.send_message(
         message.from_user.id,
         "Forwarding message, please wait...",
-        reply_to_message_id=message.id,
+        reply_parameters=_reply_parameters(message),
     )
+    _track_bot_status_message(_bot.app, message.from_user.id, last_reply_message.id)
 
     node = TaskNode(
         chat_id=src_chat.id,

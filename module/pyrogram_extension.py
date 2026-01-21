@@ -172,7 +172,11 @@ async def send_message_by_language(
     msg = language_str[language.value - 1]
 
     return await client.send_message(
-        chat_id, msg, reply_to_message_id=reply_to_message_id
+        chat_id,
+        msg,
+        reply_parameters=pyrogram.types.ReplyParameters(
+            message_id=reply_to_message_id
+        ),
     )
 
 
