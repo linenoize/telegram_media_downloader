@@ -165,6 +165,26 @@ def _parse_text_dl_flags(tokens: List[str]) -> Tuple[str, Optional[str], List[st
     return mode, None, remaining
 
 
+def _parse_order_flags(tokens: List[str]) -> Tuple[bool, Optional[str], List[str]]:
+    newest_first = False
+    error = None
+    remaining: List[str] = []
+    for token in tokens:
+        if token == "--newest":
+            newest_first = True
+        elif token.startswith("--order="):
+            value = token.split("=", 1)[1].strip().lower()
+            if value in ["newest", "desc", "latest"]:
+                newest_first = True
+            elif value in ["oldest", "asc", "earliest"]:
+                newest_first = False
+            else:
+                error = f"Unsupported order value: {value}"
+        else:
+            remaining.append(token)
+    return newest_first, error, remaining
+
+
 def _resolve_selector(
     app: Application, selector: Optional[str], selector_mode: Optional[str]
 ) -> Tuple[Optional[List[str]], Optional[dict], Optional[str], Optional[str]]:
@@ -1189,13 +1209,14 @@ async def text_download_from_bot(client: pyrogram.Client, message: pyrogram.type
         f"{_t('Parameter error, please enter according to the reference format')}:\n\n"
         f"1. {_t('Download message text')}\n"
         "<i>/text_dl https://t.me/channel all non-fiction</i>\n"
+        "<i>/text_dl https://t.me/channel all --newest non-fiction</i>\n"
         "<i>/text_dl https://t.me/channel 1 0 non-fiction</i>\n\n"
         f"2. {_t('Download urls only')}\n"
         "<i>/text_dl https://t.me/channel all --urls rapid-links.net</i>\n\n"
         f"3. {_t('Download text and urls')}\n"
         "<i>/text_dl https://t.me/channel all --both non-fiction</i>\n\n"
         f"4. {_t('With date filter')}\n"
-        "<i>/text_dl https://t.me/channel all message_date>=2024-01-01 non-fiction</i>\n"
+        "<i>/text_dl https://t.me/channel all --newest message_date>=2024-01-01 non-fiction</i>\n"
     )
 
     args = message.text.split()
@@ -1224,6 +1245,13 @@ async def text_download_from_bot(client: pyrogram.Client, message: pyrogram.type
     else:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    newest_first, order_err, remaining = _parse_order_flags(remaining)
+    if order_err:
+        await client.send_message(
+            message.from_user.id, f"{order_err}\n\n{msg}", parse_mode=pyrogram.enums.ParseMode.HTML
         )
         return
 
@@ -1319,6 +1347,7 @@ async def text_download_from_bot(client: pyrogram.Client, message: pyrogram.type
             end_offset_id=end_offset_id,
             bot=_bot.bot,
             task_id=_bot.gen_task_id(),
+            download_newest_first=newest_first,
             text_download=True,
             text_filter=text_filter,
             text_output_mode=mode,
@@ -1344,13 +1373,14 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
         f"{_t('Parameter error, please enter according to the reference format')}:\n\n"
         f"1. {_t('Download all messages of common group')}\n"
         "<i>/download https://t.me/fkdhlg all</i>\n"
+        "<i>/download https://t.me/fkdhlg all --newest</i>\n"
         "<i>/download https://t.me/fkdhlg 1 0</i>\n\n"
         f"{_t('The private group (channel) link is a random group message link')}\n\n"
         f"2. {_t('The download starts from the N message to the end of the M message')}. "
         f"{_t('When M is 0, it means the last message. The filter is optional')}\n"
         f"<i>/download https://t.me/12000000 N M [filter]</i>\n\n"
         f"3. {_t('Download with date filter (messages from specific date)')}\n"
-        f"<i>/download https://t.me/channel all message_date>=2024-01-01</i>\n"
+        f"<i>/download https://t.me/channel all --newest message_date>=2024-01-01</i>\n"
         f"<i>/download https://t.me/channel 1 0 message_date>=2024-01-01</i>\n\n"
         f"4. {_t('Download messages within date range')}\n"
         f"<i>/download https://t.me/channel all message_date>=2024-01-01&message_date<=2024-12-31</i>\n"
@@ -1389,6 +1419,13 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
     else:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+        )
+        return
+
+    newest_first, order_err, remaining = _parse_order_flags(remaining)
+    if order_err:
+        await client.send_message(
+            message.from_user.id, f"{order_err}\n\n{msg}", parse_mode=pyrogram.enums.ParseMode.HTML
         )
         return
 
@@ -1495,6 +1532,7 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
                 end_offset_id=end_offset_id,
                 bot=_bot.bot,
                 task_id=_bot.gen_task_id(),
+                download_newest_first=newest_first,
             )
             node.media_types_override = media_types_override
             node.file_formats_override = file_formats_override

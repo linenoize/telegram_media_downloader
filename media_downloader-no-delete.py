@@ -544,13 +544,18 @@ async def download_chat_task(
     node: TaskNode,
 ):
     """Download all task"""
+    offset_id = chat_download_config.last_read_message_id
+    reverse = True
+    if node.download_newest_first:
+        reverse = False
+        offset_id = node.end_offset_id if node.end_offset_id else 0
     messages_iter = get_chat_history_v2(
         client,
         node.chat_id,
         limit=node.limit,
         max_id=node.end_offset_id,
-        offset_id=chat_download_config.last_read_message_id,
-        reverse=True,
+        offset_id=offset_id,
+        reverse=reverse,
     )
 
     chat_download_config.node = node
@@ -565,6 +570,9 @@ async def download_chat_task(
             await add_download_task(message, node)
 
     async for message in messages_iter:  # type: ignore
+        if node.download_newest_first and node.start_offset_id:
+            if message.id < node.start_offset_id:
+                break
         meta_data = MetaData()
 
         caption = message.caption

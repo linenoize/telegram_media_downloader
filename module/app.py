@@ -136,6 +136,7 @@ class TaskNode:
         task_type: TaskType = TaskType.Download,
         task_id: int = 0,
         topic_id: int = 0,
+        download_newest_first: bool = False,
         text_download: bool = False,
         text_filter: Optional[str] = None,
         text_output_mode: str = "text",
@@ -181,6 +182,7 @@ class TaskNode:
         self.reply_to_message = None
         self.cloud_drive_upload_stat_dict: dict = {}
         self.text_download = text_download
+        self.download_newest_first = download_newest_first
         self.text_filter = text_filter
         self.text_output_mode = text_output_mode
 
