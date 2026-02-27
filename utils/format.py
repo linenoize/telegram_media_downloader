@@ -231,6 +231,13 @@ def extract_info_from_link(link: str) -> Link:
 
     result = Link()
 
+    # Handle fragment-based chat ID (e.g. t.me/a/#-1003108573215)
+    if u.fragment:
+        frag = u.fragment.lstrip("#")
+        if re.match(r"^-?\d+$", frag):
+            result.group_id = int(frag)
+            return result
+
     if "comment" in query:
         result.group_id = paths[0]
         result.comment_id = int(query["comment"][0])

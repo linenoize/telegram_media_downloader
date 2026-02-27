@@ -1221,6 +1221,73 @@ class HookClient(pyrogram.Client):
         super().__init__(name, **kwargs)
         self._reconnect_attempts = 0
         self._is_reconnecting = False
+        # Connection state tracking for network outage notifications
+        self._is_disconnected = False
+        self._disconnect_start_time: Optional[datetime] = None
+        self._disconnect_logged = False  # Track if disconnect warning was logged
+        self._app = None  # Application reference for admin notifications
+
+    def set_app(self, app):
+        """Set the Application reference for admin notifications."""
+        self._app = app
+
+    def _mark_disconnected(self):
+        """Mark client as disconnected and log warning once."""
+        if not self._is_disconnected:
+            self._is_disconnected = True
+            self._disconnect_start_time = datetime.now()
+            if not self._disconnect_logged:
+                logger.warning(
+                    f"{_t('Network disconnected at')} {self._disconnect_start_time.strftime('%Y-%m-%d %I:%M%p')}"
+                )
+                self._disconnect_logged = True
+
+    async def _send_reconnection_notification(self):
+        """Send admin notification with reconnection details."""
+        if not self._disconnect_start_time or not self._app:
+            return
+
+        reconnect_time = datetime.now()
+        disconnect_time = self._disconnect_start_time
+        duration = reconnect_time - disconnect_time
+        duration_minutes = int(duration.total_seconds() / 60)
+
+        # Calculate remaining files to download
+        remaining_files = 0
+        if hasattr(self._app, 'chat_download_config'):
+            for config in self._app.chat_download_config.values():
+                if config.total_task > config.finish_task:
+                    remaining_files += config.total_task - config.finish_task
+
+        # Format the notification message
+        msg_lines = [
+            f"Disconnected {disconnect_time.strftime('%Y-%m-%d')} at {disconnect_time.strftime('%I:%M%p').lower()}",
+            f"Reconnected {reconnect_time.strftime('%Y-%m-%d')} at {reconnect_time.strftime('%I:%M%p').lower()}",
+            f"Duration of {duration_minutes} minutes",
+        ]
+        if remaining_files > 0:
+            msg_lines.append(f"{remaining_files} files remaining to download")
+
+        notification_msg = "\n".join(msg_lines)
+
+        # Try to send notification via bot if available
+        try:
+            if hasattr(self._app, 'bot_token') and self._app.bot_token:
+                # Get admin user ID from allowed_user_ids
+                admin_id = None
+                if hasattr(self._app, 'allowed_user_ids') and self._app.allowed_user_ids:
+                    admin_id = self._app.allowed_user_ids[0]
+                elif self.me:
+                    admin_id = self.me.id
+
+                if admin_id:
+                    await self.send_message(admin_id, f"```\n{notification_msg}\n```")
+                    logger.info(f"{_t('Reconnection notification sent to admin')}")
+        except Exception as e:
+            logger.debug(f"Could not send reconnection notification: {e}")
+
+        # Log the reconnection info
+        logger.success(f"{_t('Connection restored')}:\n{notification_msg}")
 
     async def _create_session(self) -> "HookSession":
         """Create a session compatible with different Pyrogram/Kurigram versions."""
@@ -1312,10 +1379,12 @@ class HookClient(pyrogram.Client):
                 return await super().handle_download(packet)
             except (OSError, ConnectionError) as e:
                 if "Connection lost" in str(e) or isinstance(e, ConnectionError):
+                    # Mark as disconnected (logs warning once)
+                    self._mark_disconnected()
                     if attempt < max_attempts - 1:
-                        logger.warning(
-                            f"Connection lost during download (attempt {attempt + 1}/{max_attempts}), "
-                            f"attempting to reconnect..."
+                        # Only log attempt info, not repeated connection warnings
+                        logger.debug(
+                            f"Download reconnection attempt {attempt + 1}/{max_attempts}..."
                         )
                         await asyncio.sleep(self.RECONNECT_DELAY)
                         await self._reconnect()
@@ -1340,6 +1409,8 @@ class HookClient(pyrogram.Client):
             return
 
         self._is_reconnecting = True
+        # Mark as disconnected (logs warning once)
+        self._mark_disconnected()
 
         try:
             logger.info("Attempting to reconnect to Telegram...")
@@ -1380,6 +1451,15 @@ class HookClient(pyrogram.Client):
                     await self.invoke(pyrogram.raw.functions.updates.GetState())
 
                     self._reconnect_attempts = 0
+
+                    # Send admin notification about reconnection
+                    if self._is_disconnected:
+                        await self._send_reconnection_notification()
+                        # Reset disconnect state
+                        self._is_disconnected = False
+                        self._disconnect_start_time = None
+                        self._disconnect_logged = False
+
                     logger.success("Successfully reconnected to Telegram!")
                     return
                 except Exception as e:
@@ -1424,10 +1504,12 @@ class HookClient(pyrogram.Client):
                 return await super().invoke(query, retries, timeout, sleep_threshold)
             except OSError as e:
                 if "Connection lost" in str(e) or "Connection" in str(e.__class__.__name__):
+                    # Mark as disconnected (logs warning once)
+                    self._mark_disconnected()
                     if conn_attempt < max_connection_retries - 1:
-                        logger.warning(
-                            f"Connection lost during invoke (attempt {conn_attempt + 1}/{max_connection_retries}), "
-                            f"reconnecting..."
+                        # Only log attempt info, not repeated connection warnings
+                        logger.debug(
+                            f"Reconnection attempt {conn_attempt + 1}/{max_connection_retries}..."
                         )
                         await asyncio.sleep(self.RECONNECT_DELAY)
                         await self._reconnect()

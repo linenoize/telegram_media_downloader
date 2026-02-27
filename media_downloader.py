@@ -627,10 +627,11 @@ async def download_media(
                     )
                     break
         except (OSError, ConnectionError) as e:
-            # Handle connection loss errors
-            logger.warning(
-                f"Message[{message.id}]: {_t('Connection error occurred')}: {e}, "
-                f"{_t('retrying after')} {RETRY_TIME_OUT} {_t('seconds')}"
+            # Handle connection loss errors - HookClient handles disconnect logging
+            # Only log debug info here to avoid duplicate warnings
+            logger.debug(
+                f"Message[{message.id}]: Connection error: {e}, "
+                f"retry {retry + 1}/3"
             )
             await asyncio.sleep(RETRY_TIME_OUT)
             if _check_timeout(retry, message.id):
@@ -833,6 +834,8 @@ def main():
         workdir=app.session_file_path,
         start_timeout=app.start_timeout,
     )
+    # Set app reference for admin notifications on reconnection
+    client.set_app(app)
     try:
         app.pre_run()
         init_web(app)

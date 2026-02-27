@@ -46,10 +46,12 @@ class CleanupManager:
         self.skipped_messages: Dict[Union[int, str], Set[int]] = {}
         self.bot_status_messages: Dict[Union[int, str], List[int]] = {}
         self.is_running = True
+        self.downloads_since_last_cleanup = False  # Track if downloads occurred since last cleanup
 
     def update_activity(self):
-        """Update the last download activity timestamp."""
+        """Update the last download activity timestamp and mark downloads occurred."""
         self.last_download_time = time.time()
+        self.downloads_since_last_cleanup = True
 
     def add_skipped_message(
         self, chat_id: Union[int, str], message_id: int, reason: str = None
@@ -101,6 +103,15 @@ class CleanupManager:
                 idle_time = time.time() - self.last_download_time
 
                 if idle_time >= self.idle_timeout and not self.cleanup_running:
+                    # Only run cleanup if downloads have occurred since last cleanup
+                    if not self.downloads_since_last_cleanup:
+                        logger.debug(
+                            f"{_t('Cleanup skipped')} - {_t('no new downloads since last cleanup')}"
+                        )
+                        # Reset the timer without running cleanup
+                        self.last_download_time = time.time()
+                        continue
+
                     logger.info(
                         f"{_t('No downloads for')} {self.idle_timeout / 3600} {_t('hours')}, "
                         f"{_t('starting cleanup')}..."
@@ -170,8 +181,9 @@ class CleanupManager:
             logger.exception(f"{_t('Error during cleanup')}: {e}")
         finally:
             self.cleanup_running = False
-            # Reset the timer after cleanup
+            # Reset the timer and downloads flag after cleanup
             self.last_download_time = time.time()
+            self.downloads_since_last_cleanup = False
 
     async def _cleanup_chat_messages(
         self, chat_id: Union[int, str], message_ids: List[int]

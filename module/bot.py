@@ -758,6 +758,46 @@ async def get_info(client: pyrogram.Client, message: pyrogram.types.Message):
         msg,
     )
 
+    # Send download examples and inline button if we resolved an entity
+    if entity:
+        try:
+            if entity.username:
+                base = f"https://t.me/{entity.username}"
+            else:
+                chat_id_str = str(entity.id)
+                if chat_id_str.startswith("-100"):
+                    cid = chat_id_str[4:]
+                else:
+                    cid = chat_id_str.lstrip("-")
+                base = f"https://t.me/c/{cid}/1"
+
+            examples = (
+                f"**Example download commands:**\n"
+                f"`/download {base} all`\n"
+                f"`/download {base} all --ext .epub`\n"
+                f"`/download {base} all --type images`\n"
+                f"`/download {base} all message_date>=2024-01-01`\n"
+            )
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Download all from this channel",
+                            callback_data=f"download_all {entity.id}",
+                        )
+                    ]
+                ]
+            )
+
+            await client.send_message(
+                message.from_user.id,
+                examples,
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send download examples: {e}")
+
 
 async def get_channel_url(client: pyrogram.Client, message: pyrogram.types.Message):
     """
@@ -1952,6 +1992,57 @@ async def stop_task(
         _bot.stop_task(task_id)
 
 
+async def handle_download_all(
+    client: pyrogram.Client, query: pyrogram.types.CallbackQuery
+):
+    """Handle the 'Download all' inline button callback."""
+    parts = query.data.split(maxsplit=1)
+    if len(parts) < 2:
+        await query.answer("Invalid callback data.")
+        return
+
+    chat_id = int(parts[1])
+
+    try:
+        entity = await _bot.client.get_chat(chat_id)
+        if not entity:
+            await query.answer("Could not access the chat.")
+            return
+
+        chat_title = entity.title or str(chat_id)
+        chat_download_config = ChatDownloadConfig()
+        chat_download_config.last_read_message_id = 1
+
+        reply_message = f"from {chat_title} downloading all messages"
+
+        await query.edit_message_text(f"Starting download from **{chat_title}**...")
+
+        last_reply_message = await client.send_message(
+            query.from_user.id,
+            reply_message,
+        )
+        _track_bot_status_message(_bot.app, query.from_user.id, last_reply_message.id)
+
+        node = TaskNode(
+            chat_id=entity.id,
+            from_user_id=query.from_user.id,
+            reply_message_id=last_reply_message.id,
+            replay_message=reply_message,
+            limit=0,
+            start_offset_id=1,
+            end_offset_id=0,
+            bot=_bot.bot,
+            task_id=_bot.gen_task_id(),
+        )
+        _bot.add_task_node(node)
+        _bot.app.loop.create_task(
+            _bot.download_chat_task(_bot.client, chat_download_config, node)
+        )
+    except Exception as e:
+        logger.error(f"Error in handle_download_all: {e}")
+        await query.answer(f"Error: {e}", show_alert=True)
+
+
 async def on_query_handler(
     client: pyrogram.Client, query: pyrogram.types.CallbackQuery
 ):
@@ -1965,6 +2056,10 @@ async def on_query_handler(
     Returns:
         None
     """
+
+    if query.data and query.data.startswith("download_all"):
+        await handle_download_all(client, query)
+        return
 
     for it in QueryHandler:
         queryHandler = QueryHandlerStr.get_str(it.value)
