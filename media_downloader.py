@@ -13,7 +13,7 @@ from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
 from rich.logging import RichHandler
 
 from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
-from module.bot import start_download_bot, stop_download_bot
+from module.bot import notify_admin_retry_started, start_download_bot, stop_download_bot
 from module.cleanup import CleanupManager
 from module.download_stat import update_download_status
 from module.get_chat_history_v2 import get_chat_history_v2
@@ -715,13 +715,67 @@ async def download_chat_task(
     chat_download_config.node = node
 
     if chat_download_config.ids_to_retry and not node.text_download:
-        logger.info(f"{_t('Downloading files failed during last run')}...")
-        skipped_messages: list = await client.get_messages(  # type: ignore
-            chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
+        retry_ids = chat_download_config.ids_to_retry
+        total = len(retry_ids)
+        batch_size = 200
+        total_batches = (total + batch_size - 1) // batch_size
+        try:
+            entity = await client.get_chat(node.chat_id)
+            chat_title = getattr(entity, "title", None) or str(node.chat_id)
+        except Exception:
+            chat_title = str(node.chat_id)
+        app.retry_sessions[node.chat_id] = {
+            "message_ids": list(retry_ids),
+            "chat_title": chat_title,
+        }
+        if app.bot_token:
+            try:
+                await notify_admin_retry_started(
+                    app, client, node.chat_id, total, total_batches
+                )
+            except Exception as e:
+                logger.warning(
+                    f"{_t('Failed to send retry notification to admin')}: {e}"
+                )
+        logger.info(
+            f"{_t('Downloading files failed during last run')}"
+            f" ({total} files, {total_batches} batches)..."
         )
-
-        for message in skipped_messages:
-            await add_download_task(message, node)
+        for batch_num, i in enumerate(range(0, total, batch_size), 1):
+            batch_ids = retry_ids[i : i + batch_size]
+            try:
+                skipped_messages: list = await client.get_messages(  # type: ignore
+                    chat_id=node.chat_id, message_ids=batch_ids
+                )
+                for message in skipped_messages:
+                    await add_download_task(message, node)
+                logger.info(
+                    f"Retry batch {batch_num}/{total_batches} queued"
+                    f" ({len(batch_ids)} messages)"
+                )
+            except pyrogram.errors.exceptions.flood_420.FloodWait as e:
+                logger.warning(
+                    f"Rate limited during retry batch {batch_num},"
+                    f" waiting {e.value}s..."
+                )
+                await asyncio.sleep(e.value)
+                try:
+                    skipped_messages = await client.get_messages(  # type: ignore
+                        chat_id=node.chat_id, message_ids=batch_ids
+                    )
+                    for message in skipped_messages:
+                        await add_download_task(message, node)
+                except Exception as retry_err:
+                    logger.warning(
+                        f"Retry batch {batch_num} failed after FloodWait:"
+                        f" {retry_err}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Retry batch {batch_num}/{total_batches} failed: {e}"
+                )
+            if i + batch_size < total:
+                await asyncio.sleep(0.5)
 
     async for message in messages_iter:  # type: ignore
         if node.download_newest_first and node.start_offset_id:
@@ -797,7 +851,7 @@ async def run_until_all_task_finish():
             if not value.need_check or value.total_task != value.finish_task:
                 finish = False
 
-        if (not app.bot_token and finish) or app.restart_program:
+        if (not app.bot_token and not app.search_enabled and finish) or app.restart_program:
             break
 
         await asyncio.sleep(1)
@@ -863,6 +917,56 @@ def main():
                 f"{_t('will run after')} {app.cleanup_idle_hours} {_t('hours of inactivity')}"
             )
 
+        # Initialize fuzzy search module
+        search_db = None
+        if app.search_enabled:
+            from search.database import SearchDatabase
+            from search.indexer import run_full_sync
+
+            search_config = app.config.get("search", {})
+            db_path = search_config.get("db_path", "search_index.db")
+            search_db = SearchDatabase(db_path)
+            search_db.initialize()
+            app._search_db = search_db
+
+            # Initialize cross-language translator if configured
+            translator = None
+            translate_config = search_config.get("translate", {})
+            if translate_config.get("enabled", False):
+                try:
+                    from search.translator import TranslationManager
+                    translator = TranslationManager(
+                        search_db.conn, True, translate_config
+                    )
+                    translator.initialize()
+                    app._translator = translator
+                    logger.info("Cross-language search translation enabled")
+                except ImportError:
+                    logger.warning(
+                        "Install langdetect and deep-translator for "
+                        "cross-language search"
+                    )
+
+            # Register real-time indexing on user client (even without bot)
+            if not app.bot_token:
+                from search.commands import register_search_handlers
+                register_search_handlers(
+                    bot_client=None,
+                    user_client=client,
+                    db=search_db,
+                    search_config=search_config,
+                    allowed_user_ids=[],
+                    download_directory=app.save_path,
+                    translator=translator,
+                )
+
+            # Run background sync if configured
+            if search_config.get("index_on_startup", True):
+                logger.info("Starting background search index sync...")
+                app.loop.create_task(run_full_sync(client, search_db, search_config))
+
+            logger.info("Fuzzy search module initialized.")
+
         app.loop.create_task(download_all_chat(client))
         for _ in range(app.max_download_task):
             task = app.loop.create_task(worker(client))
@@ -883,6 +987,10 @@ def main():
         # Stop cleanup manager
         if cleanup_manager:
             cleanup_manager.stop()
+
+        # Close search database
+        if search_db:
+            search_db.close()
 
         if app.bot_token:
             app.loop.run_until_complete(stop_download_bot())

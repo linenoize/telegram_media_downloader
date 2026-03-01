@@ -20,6 +20,7 @@
       <ul class="layui-tab-title">
         <li class="layui-this">Downloading</li>
         <li>Downloaded</li>
+        <li>Retry list</li>
         <!-- <li>Config</li> -->
       </ul>
       <div class="stop-btn" id="download_state" data-value="{{ download_state }}" onclick="download_state_change(this)"> {{ download_state }} </div>
@@ -30,6 +31,9 @@
       </div>
       <div class="layui-tab-item">
         <table class="layui-hide" id="already_download_list" lay-filter="already_download_list"></table>
+      </div>
+      <div class="layui-tab-item">
+        <table class="layui-hide" id="retry_list" lay-filter="retry_list"></table>
       </div>
       <!-- <div class="layui-tab-item">
         <form class="layui-form" action="">
@@ -72,6 +76,7 @@
       var $ = layui.$;
       var already_download_list_data = new Array()
       var download_list_table_data = new Array()
+      var retry_list_data = new Array()
 
       $.ajax({
         url: "get_app_version"
@@ -141,6 +146,26 @@
           , { field: 'total_size', title: 'total size', align: 'center' }
           , { field: 'save_path', title: 'save path', align: 'center' }
         ]], done: function (res, currentCount) {
+          element.render()
+        }
+      });
+
+      table.render({
+        elem: '#retry_list'
+        , id: 'retry_list'
+        , data: retry_list_data
+        , title: 'retry_list'
+        , height: 'full-160'
+        , limit: 10000
+        , cols: [[
+          { field: 'chat_title', title: 'Channel', width: 180 },
+          { field: 'chat_id', title: 'Chat ID', width: 120 },
+          { field: 'total', title: 'Total', width: 80 },
+          { field: 'pending_count', title: 'Pending', width: 80 },
+          { field: 'completed_count', title: 'Completed', width: 90 },
+          { field: 'pending_ids_preview', title: 'Pending message IDs', minWidth: 150 }
+        ]]
+        , done: function (res, currentCount) {
           element.render()
         }
       });
@@ -236,6 +261,34 @@
       var update_download_list_int = self.setInterval(update_download_list, 1000);
       var update_download_status_int = self.setInterval(update_download_status, 1000);
       var update_already_download_list_int = 0;
+      var update_retry_list_int = 0;
+
+      function update_retry_list() {
+        $.ajax({
+          url: "get_retry_list"
+          , type: "get"
+          , async: false
+          , dataType: "json"
+          , success: function (result) {
+            var sessions = result.sessions || [];
+            retry_list_data = sessions.map(function (s) {
+              var pendingCount = (s.pending_ids && s.pending_ids.length) || 0;
+              var preview = (s.pending_ids && s.pending_ids.length)
+                ? s.pending_ids.slice(0, 15).join(', ') + (s.pending_ids.length > 15 ? '...' : '')
+                : '';
+              return {
+                chat_id: s.chat_id,
+                chat_title: s.chat_title || String(s.chat_id),
+                total: s.total,
+                pending_count: pendingCount,
+                completed_count: s.completed_count || 0,
+                pending_ids_preview: preview
+              };
+            });
+            table.reload('retry_list', { data: retry_list_data });
+          }
+        });
+      }
 
 
       function update_already_download_list() {
@@ -302,6 +355,15 @@
 
         if (data.index == 1) {
           update_already_download_list_int = self.setInterval(update_already_download_list, 1000);
+        }
+
+        if (data.index != 2) {
+          clearInterval(update_retry_list_int);
+        }
+
+        if (data.index == 2) {
+          update_retry_list();
+          update_retry_list_int = self.setInterval(update_retry_list, 1000);
         }
 
       });

@@ -1,6 +1,7 @@
 """Bot for media downloader"""
 
 import asyncio
+import html
 import os
 from datetime import datetime
 from typing import Callable, List, Optional, Tuple, Union
@@ -380,6 +381,9 @@ class DownloadBot:
             types.BotCommand("set_language", _t("Set language")),
             types.BotCommand("stop", _t("Stop bot download or forward")),
             types.BotCommand("search_mega", _t("Search for mega links in a chat")),
+            types.BotCommand("search", _t("Fuzzy search across indexed channels")),
+            types.BotCommand("searchstatus", _t("Search index statistics")),
+            types.BotCommand("searchsync", _t("Sync new messages to search index")),
         ]
 
         self.app = app
@@ -536,6 +540,20 @@ class DownloadBot:
 
         add_search_handler(_bot)
 
+        # Register fuzzy search handlers if search is enabled
+        if app.search_enabled:
+            from search.commands import register_search_handlers
+            search_config = app.config.get("search", {})
+            register_search_handlers(
+                bot_client=self.bot,
+                user_client=self.client,
+                db=app._search_db,
+                search_config=search_config,
+                allowed_user_ids=self.allowed_user_ids,
+                download_directory=app.save_path,
+                translator=getattr(app, '_translator', None),
+            )
+
 
 _bot = DownloadBot()
 
@@ -559,6 +577,45 @@ async def stop_download_bot():
     _bot.stop_task("all")
     if _bot.bot:
         await _bot.bot.stop()
+
+
+async def notify_admin_retry_started(
+    app: Application,
+    client: pyrogram.Client,
+    chat_id: Union[int, str],
+    total_files: int,
+    total_batches: int,
+):
+    """
+    Notify admin(s) via Telegram when the bot is about to resume retries
+    for files that failed during the last run.
+    """
+    if not _bot.bot or not getattr(_bot, "allowed_user_ids", None):
+        return
+    try:
+        entity = await client.get_chat(chat_id)
+        chat_title = getattr(entity, "title", None) or str(chat_id)
+    except Exception:
+        chat_title = str(chat_id)
+    web_url = ""
+    if getattr(app, "web_port", None) and app.web_port:
+        host = getattr(app, "web_host", "0.0.0.0") or "0.0.0.0"
+        web_url = f" http://{host}:{app.web_port}"
+    safe_title = html.escape(str(chat_title))
+    msg = (
+        f"{_t('Downloading files failed during last run')}. "
+        f"{_t('Resuming retries for channel')} <b>{safe_title}</b> "
+        f"(id {chat_id}): {total_files} {_t('files')}, {total_batches} {_t('batches')}. "
+        f"{_t('Continuing now')}. "
+        f"{_t('See website for list')}.{web_url}"
+    )
+    for admin_id in _bot.allowed_user_ids:
+        try:
+            await _bot.bot.send_message(
+                admin_id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.warning(f"{_t('Failed to send retry notification to admin')}: {e}")
 
 
 async def send_help_str(client: pyrogram.Client, chat_id):

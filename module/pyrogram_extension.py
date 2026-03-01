@@ -1092,6 +1092,12 @@ def set_meta_data(
     meta_data.file_extension = get_extension(
         media_obj.file_id, getattr(media_obj, "mime_type", ""), False
     )
+    name = (meta_data.media_file_name or "").strip()
+    if name:
+        _, ext = os.path.splitext(name)
+        ext = ext.lstrip(".").lower()
+        if ext:
+            meta_data.file_extension = ext
 
 
 async def parse_link(client: pyrogram.Client, link_str: str):
@@ -1480,6 +1486,7 @@ class HookClient(pyrogram.Client):
         retries: int = pyrogram.session.Session.MAX_RETRIES,
         timeout: float = pyrogram.session.Session.WAIT_TIMEOUT,
         sleep_threshold: float = None,
+        **kwargs,
     ):
         """
         Override invoke to add connection loss handling.
@@ -1489,6 +1496,8 @@ class HookClient(pyrogram.Client):
             retries: Number of retries
             timeout: Timeout in seconds
             sleep_threshold: Sleep threshold for flood wait
+            **kwargs: Additional arguments passed to parent invoke
+                (e.g. retry_delay, recaptcha_token, business_connection_id)
 
         Returns:
             Result from the query
@@ -1496,12 +1505,12 @@ class HookClient(pyrogram.Client):
         # Skip connection retry if we're already in the middle of reconnecting
         # to avoid infinite recursion
         if self._is_reconnecting:
-            return await super().invoke(query, retries, timeout, sleep_threshold)
+            return await super().invoke(query, retries, timeout, sleep_threshold, **kwargs)
 
         max_connection_retries = 3
         for conn_attempt in range(max_connection_retries):
             try:
-                return await super().invoke(query, retries, timeout, sleep_threshold)
+                return await super().invoke(query, retries, timeout, sleep_threshold, **kwargs)
             except OSError as e:
                 if "Connection lost" in str(e) or "Connection" in str(e.__class__.__name__):
                     # Mark as disconnected (logs warning once)

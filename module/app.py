@@ -382,6 +382,7 @@ class Application:
         self.total_download_task = 0
 
         self.chat_download_config: dict = {}
+        self.retry_sessions: dict = {}
 
         self.save_path = os.path.join(os.path.abspath("."), "downloads")
         self.temp_save_path = os.path.join(os.path.abspath("."), "temp")
@@ -428,6 +429,9 @@ class Application:
         self.cleanup_delete_skipped: bool = True
         self.cleanup_delete_bot_status: bool = False
         self.cleanup_manager = None
+
+        # Search configuration
+        self.search_enabled: bool = False
 
         self.forward_limit_call = LimitCall(max_limit_call_times=33)
 
@@ -582,6 +586,13 @@ class Application:
             )
             self.cleanup_delete_bot_status = get_config(
                 cleanup_config, "delete_bot_status", self.cleanup_delete_bot_status, bool, False
+            )
+
+        # Load search configuration
+        search_config = _config.get("search", {})
+        if search_config:
+            self.search_enabled = get_config(
+                search_config, "enabled", self.search_enabled, bool, False
             )
 
         try:
@@ -872,6 +883,8 @@ class Application:
                     unfinished_ids.add(_idx)
 
             self.chat_download_config[key].ids_to_retry = list(unfinished_ids)
+            if not value.ids_to_retry and key in self.retry_sessions:
+                self.retry_sessions.pop(key, None)
 
             if idx >= len(self.app_data["chat"]):
                 self.app_data["chat"].append({})

@@ -3,6 +3,7 @@
 import logging
 import os
 import threading
+from typing import Optional
 
 from flask import Flask, jsonify, render_template, request
 from flask_login import LoginManager, UserMixin, login_required, login_user
@@ -23,6 +24,7 @@ log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
 _flask_app = Flask(__name__)
+_web_app: Optional[Application] = None
 
 _flask_app.secret_key = "tdl"
 _login_manager = LoginManager()
@@ -81,7 +83,8 @@ def init_web(app: Application):
     Returns:
         None.
     """
-    global web_login_users
+    global web_login_users, _web_app
+    _web_app = app
     if app.web_login_secret:
         web_login_users = {"root": app.web_login_secret}
     else:
@@ -220,3 +223,55 @@ def get_download_list():
 
     result += "]"
     return result
+
+
+@_flask_app.route("/get_retry_list")
+@login_required
+def get_retry_list():
+    """Get retry sessions: channels with pending/completed retry file counts."""
+    if _web_app is None:
+        return jsonify({"sessions": []})
+    filter_chat_id = request.args.get("chat_id")
+    sessions = []
+    seen_chat_ids = set()
+    retry_sessions = getattr(_web_app, "retry_sessions", {}) or {}
+    for chat_id, session in retry_sessions.items():
+        if filter_chat_id is not None and str(chat_id) != str(filter_chat_id):
+            continue
+        seen_chat_ids.add(chat_id)
+        chat_config = _web_app.chat_download_config.get(chat_id)
+        pending_ids = (
+            list(chat_config.ids_to_retry)
+            if chat_config and getattr(chat_config, "ids_to_retry", None)
+            else []
+        )
+        message_ids = session.get("message_ids") or []
+        total = len(message_ids)
+        completed_count = total - len(pending_ids)
+        sessions.append(
+            {
+                "chat_id": chat_id,
+                "chat_title": session.get("chat_title") or str(chat_id),
+                "pending_ids": pending_ids,
+                "total": total,
+                "completed_count": completed_count,
+            }
+        )
+    for chat_id, chat_config in getattr(_web_app, "chat_download_config", {}).items():
+        if chat_id in seen_chat_ids:
+            continue
+        ids_to_retry = getattr(chat_config, "ids_to_retry", None) or []
+        if not ids_to_retry:
+            continue
+        if filter_chat_id is not None and str(chat_id) != str(filter_chat_id):
+            continue
+        sessions.append(
+            {
+                "chat_id": chat_id,
+                "chat_title": str(chat_id),
+                "pending_ids": list(ids_to_retry),
+                "total": len(ids_to_retry),
+                "completed_count": 0,
+            }
+        )
+    return jsonify({"sessions": sessions})
